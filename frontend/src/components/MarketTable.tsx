@@ -2,16 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 import type { Market, MarketMatchMap } from "../types";
 import { getMarketKey } from "../utils/marketMatcher";
 
-type SortField = "title" | "yes_bid" | "no_bid" | "volume" | "end_date";
+type SortField = "title" | "yes_bid" | "no_bid" | "volume" | "end_date" | "edge";
 type SortDir = "asc" | "desc";
 
 interface MarketTableProps {
   markets: Market[];
+  allMarkets: Market[];
   loading: boolean;
   searchQuery: string;
   suggestedMatches: MarketMatchMap;
   onMarketClick: (market: Market) => void;
   isInterested: (id: string, source: Market["source"]) => boolean;
+  selectedId?: string | null;
+  onToggleSelect?: (market: Market) => void;
 }
 
 const INITIAL_VISIBLE_ROWS = 250;
@@ -66,7 +69,7 @@ const MATCH_COLORS = [
   },
 ];
 
-export function MarketTable({ markets, loading, searchQuery, suggestedMatches, onMarketClick, isInterested }: MarketTableProps) {
+export function MarketTable({ markets, allMarkets, loading, searchQuery, suggestedMatches, onMarketClick, isInterested, selectedId, onToggleSelect }: MarketTableProps) {
   const [sortField, setSortField] = useState<SortField>("volume");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [visibleRowsCount, setVisibleRowsCount] = useState(INITIAL_VISIBLE_ROWS);
@@ -105,8 +108,26 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
     });
   }, [indexedRows, globalWords, localWords]);
 
+  const peerById = useMemo(() => {
+    const map = new Map<string, Market>();
+    for (const m of allMarkets) map.set(`${m.source}:${m.id}`, m);
+    return map;
+  }, [allMarkets]);
+
   const sorted = useMemo(() => {
     return [...filtered].sort((a, b) => {
+      // Edge sort: bypass grouping, rank all markets by arb edge desc
+      if (sortField === "edge") {
+        const aMatch = suggestedMatches[a.key];
+        const bMatch = suggestedMatches[b.key];
+        const aPeer = aMatch ? peerById.get(`${aMatch.peerSource}:${aMatch.peerId}`) : undefined;
+        const bPeer = bMatch ? peerById.get(`${bMatch.peerSource}:${bMatch.peerId}`) : undefined;
+        const edgeA = aPeer ? computeEdge(a.market, aPeer) ?? -Infinity : -Infinity;
+        const edgeB = bPeer ? computeEdge(b.market, bPeer) ?? -Infinity : -Infinity;
+        return sortDir === "asc" ? edgeA - edgeB : edgeB - edgeA;
+      }
+
+      // Default: matched markets float to top sorted by text similarity
       const aMatch = suggestedMatches[a.key];
       const bMatch = suggestedMatches[b.key];
 
@@ -128,7 +149,7 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
       }
       return sortDir === "asc" ? cmp : -cmp;
     });
-  }, [filtered, sortField, sortDir, suggestedMatches]);
+  }, [filtered, sortField, sortDir, suggestedMatches, peerById]);
 
   const visibleRows = useMemo(
     () => sorted.slice(0, visibleRowsCount),
@@ -181,6 +202,7 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
       <table className="w-full text-sm table-fixed">
         <thead>
           <tr className="border-b border-gray-700 text-left">
+            {onToggleSelect && <th className="pl-3 pr-1 py-2 w-[28px]" />}
             <th
               className="px-3 py-2 cursor-pointer hover:text-white w-[40%]"
               onClick={() => handleSort("title")}
@@ -211,6 +233,15 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
             >
               Closes <SortIcon field="end_date" />
             </th>
+            <th
+              className={`px-3 py-2 cursor-pointer whitespace-nowrap w-[10%] text-center transition-colors ${
+                sortField === "edge" ? "text-yellow-300" : "text-gray-400 hover:text-white"
+              }`}
+              onClick={() => handleSort("edge")}
+              title="Arb edge vs suggested counterpart (click to sort all markets by edge)"
+            >
+              Edge <SortIcon field="edge" />
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -220,14 +251,33 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
             const matchColor = match ? MATCH_COLORS[match.colorIndex] : null;
             const interested = isInterested(market.id, market.source);
 
+            const isSelected = selectedId === market.id;
+
             return (
               <tr
                 key={market.id}
                 onClick={() => onMarketClick(market)}
                 className={`h-12 border-b cursor-pointer transition-colors ${
-                  matchColor ? matchColor.row : "border-gray-800 hover:bg-gray-800/50"
+                  isSelected
+                    ? "bg-blue-900/30 border-blue-700"
+                    : matchColor
+                      ? matchColor.row
+                      : "border-gray-800 hover:bg-gray-800/50"
                 }`}
               >
+                {onToggleSelect && (
+                  <td
+                    className="pl-3 pr-1 py-2"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => onToggleSelect(market)}
+                      className="w-3.5 h-3.5 accent-blue-500 cursor-pointer"
+                    />
+                  </td>
+                )}
                 <td className="px-3 py-2 truncate">
                   <div className="flex items-center gap-1.5">
                     {interested && (
@@ -255,6 +305,21 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
                 <td className="px-3 py-2 text-gray-400 whitespace-nowrap">
                   {formatDate(market.end_date)}
                 </td>
+                <td className="px-3 py-2 text-center">
+                  {(() => {
+                    const match = suggestedMatches[row.key];
+                    const peer = match ? peerById.get(`${match.peerSource}:${match.peerId}`) : undefined;
+                    const edge = peer ? computeEdge(market, peer) : null;
+                    if (edge === null) return <span className="text-gray-700 text-xs">—</span>;
+                    return (
+                      <span className={`text-xs font-mono font-semibold ${
+                        edge > 0.02 ? "text-green-400" : edge < -0.02 ? "text-red-400" : "text-gray-500"
+                      }`}>
+                        {edge > 0 ? "+" : ""}{(edge * 100).toFixed(1)}%
+                      </span>
+                    );
+                  })()}
+                </td>
               </tr>
             );
           })}
@@ -276,6 +341,40 @@ export function MarketTable({ markets, loading, searchQuery, suggestedMatches, o
       )}
     </div>
   );
+}
+
+function getFees(): { polyFee: number; kalshiFee: number } {
+  try {
+    return { polyFee: 0.02, kalshiFee: 0.07, ...JSON.parse(localStorage.getItem("thanos:fees") ?? "{}") };
+  } catch {
+    return { polyFee: 0.02, kalshiFee: 0.07 };
+  }
+}
+
+/** Returns net-of-fee edge using entry-cost fee model. */
+function computeEdge(a: Market, b: Market): number | null {
+  const poly   = a.source === "polymarket" ? a : b;
+  const kalshi = a.source === "kalshi"     ? a : b;
+  const { polyFee, kalshiFee } = getFees();
+
+  let edgeA: number | null = null;
+  let edgeB: number | null = null;
+
+  if (poly.yes_ask > 0 && kalshi.no_ask > 0) {
+    const polyEff   = poly.yes_ask * (1 + polyFee);
+    const kalshiEff = kalshi.no_ask + kalshiFee * kalshi.no_ask * (1 - kalshi.no_ask);
+    edgeA = 1 - polyEff - kalshiEff;
+  }
+  if (kalshi.yes_ask > 0 && poly.no_ask > 0) {
+    const kalshiEff = kalshi.yes_ask + kalshiFee * kalshi.yes_ask * (1 - kalshi.yes_ask);
+    const polyEff   = poly.no_ask * (1 + polyFee);
+    edgeB = 1 - kalshiEff - polyEff;
+  }
+
+  if (edgeA === null && edgeB === null) return null;
+  if (edgeA === null) return edgeB;
+  if (edgeB === null) return edgeA;
+  return Math.max(edgeA, edgeB);
 }
 
 function fmtCent(value: number): string {

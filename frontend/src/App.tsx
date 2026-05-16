@@ -1,9 +1,13 @@
-import { useDeferredValue, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useMarkets } from "./hooks/useMarkets";
 import { useInterestedMarkets } from "./hooks/useInterestedMarkets";
+import { useWhitelistedPairs } from "./hooks/useWhitelistedPairs";
+import { usePositions } from "./hooks/usePositions";
 import { MarketTable } from "./components/MarketTable";
 import { MarketModal } from "./components/MarketModal";
 import { FilterBar } from "./components/FilterBar";
+import { WhitelistedPanel } from "./components/WhitelistedPanel";
+import { PositionsPanel } from "./components/PositionsPanel";
 import { findSuggestedMatches } from "./utils/marketMatcher";
 import type { Market, MarketFilters, MarketMatchMap } from "./types";
 
@@ -25,6 +29,58 @@ export default function App() {
   const [suggestedMatchingEnabled, setSuggestedMatchingEnabled] = useState(true);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
   const { add, remove, isInterested } = useInterestedMarkets();
+  const { pairs, addPair, removePair } = useWhitelistedPairs();
+  const { positions, addPosition, removePosition } = usePositions();
+  const [selectedPoly, setSelectedPoly] = useState<Market | null>(null);
+  const [selectedKalshi, setSelectedKalshi] = useState<Market | null>(null);
+  const [pairsLiveMarkets, setPairsLiveMarkets] = useState<Market[]>([]);
+  const [pairsRefreshing, setPairsRefreshing] = useState(false);
+  const didAutoRefreshPairs = useRef(false);
+
+  function handleTogglePoly(market: Market) {
+    setSelectedPoly((prev) => (prev?.id === market.id ? null : market));
+  }
+
+  function handleToggleKalshi(market: Market) {
+    setSelectedKalshi((prev) => (prev?.id === market.id ? null : market));
+  }
+
+  async function handleRefreshPairs() {
+    if (!pairs.length) return;
+    setPairsRefreshing(true);
+    try {
+      const polyIds = [...new Set(pairs.map((p) => p.polyId))].join(",");
+      const kalshiIds = [...new Set(pairs.map((p) => p.kalshiId))].join(",");
+      const res = await fetch(
+        `/api/markets/pairs?poly_ids=${encodeURIComponent(polyIds)}&kalshi_ids=${encodeURIComponent(kalshiIds)}`,
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setPairsLiveMarkets([...(data.polymarket ?? []), ...(data.kalshi ?? [])]);
+      }
+    } finally {
+      setPairsRefreshing(false);
+    }
+  }
+
+  // Auto-refresh whitelisted pair prices once on mount if any pairs are saved
+  useEffect(() => {
+    if (!didAutoRefreshPairs.current && pairs.length > 0) {
+      didAutoRefreshPairs.current = true;
+      handleRefreshPairs();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairs.length]);
+
+  function handleWhitelist() {
+    if (!selectedPoly || !selectedKalshi) return;
+    addPair(
+      { id: selectedPoly.id, title: selectedPoly.title },
+      { id: selectedKalshi.id, title: selectedKalshi.title },
+    );
+    setSelectedPoly(null);
+    setSelectedKalshi(null);
+  }
 
   const suggestedMatches = useMemo(
     () => findSuggestedMatches(polymarkets, kalshiMarkets),
@@ -62,8 +118,13 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 px-6 py-4 max-w-[1800px] mx-auto w-full">
-        <div className="mb-4">
+      <main className="flex-1 px-6 py-4 max-w-[1800px] mx-auto w-full space-y-4">
+        <PositionsPanel
+          positions={positions}
+          onRemove={removePosition}
+        />
+
+        <div>
           <FilterBar
             filters={filters}
             onFiltersChange={setFilters}
@@ -84,16 +145,32 @@ export default function App() {
           </div>
         )}
 
-        {!lastRefreshed && !loading && (
-          <div className="flex items-center justify-center h-64 text-gray-500">
-            <div className="text-center">
-              <p className="text-lg mb-2">Click "Refresh" to load markets</p>
-              <p className="text-sm">
-                Data will be fetched from Polymarket and Kalshi
-              </p>
+        <div className="space-y-3">
+          {(pairs.length > 0 || lastRefreshed || loading) && (
+            <WhitelistedPanel
+              pairs={pairs}
+              allMarkets={allMarkets}
+              liveMarkets={pairsLiveMarkets}
+              selectedPoly={selectedPoly}
+              selectedKalshi={selectedKalshi}
+              onWhitelist={handleWhitelist}
+              onRemovePair={removePair}
+              onRefreshPairs={handleRefreshPairs}
+              pairsRefreshing={pairsRefreshing}
+              onRecordPosition={addPosition}
+            />
+          )}
+
+          {!lastRefreshed && !loading && (
+            <div className="flex items-center justify-center h-64 text-gray-500">
+              <div className="text-center">
+                <p className="text-lg mb-2">Click "Refresh" to load markets</p>
+                <p className="text-sm">
+                  Data will be fetched from Polymarket and Kalshi
+                </p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
         {(lastRefreshed || loading) && (
           <div className="space-y-3">
@@ -110,11 +187,14 @@ export default function App() {
                 </div>
                 <MarketTable
                   markets={polymarkets}
+                  allMarkets={allMarkets}
                   loading={loading}
                   searchQuery={deferredSearchQuery}
                   suggestedMatches={activeSuggestedMatches}
                   onMarketClick={setSelectedMarket}
                   isInterested={isInterested}
+                  selectedId={selectedPoly?.id ?? null}
+                  onToggleSelect={handleTogglePoly}
                 />
               </div>
 
@@ -124,16 +204,20 @@ export default function App() {
                 </div>
                 <MarketTable
                   markets={kalshiMarkets}
+                  allMarkets={allMarkets}
                   loading={loading}
                   searchQuery={deferredSearchQuery}
                   suggestedMatches={activeSuggestedMatches}
                   onMarketClick={setSelectedMarket}
                   isInterested={isInterested}
+                  selectedId={selectedKalshi?.id ?? null}
+                  onToggleSelect={handleToggleKalshi}
                 />
               </div>
             </div>
           </div>
         )}
+        </div>
       </main>
 
       <footer className="border-t border-gray-800 px-6 py-3 text-center text-xs text-gray-600">
@@ -149,6 +233,10 @@ export default function App() {
           onAddInterested={() => add({ id: selectedMarket.id, source: selectedMarket.source, title: selectedMarket.title })}
           onRemoveInterested={() => remove(selectedMarket.id, selectedMarket.source)}
           onClose={() => setSelectedMarket(null)}
+          onWhitelistPair={(poly, kalshi) => {
+            addPair({ id: poly.id, title: poly.title }, { id: kalshi.id, title: kalshi.title });
+          }}
+          whitelistedPairIds={new Set(pairs.map((p) => p.id))}
         />
       )}
     </div>

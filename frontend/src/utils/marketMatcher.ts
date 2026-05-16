@@ -193,6 +193,7 @@ function buildMatch(
     groupId,
     colorIndex,
     score,
+    peerId: peer.id,
     peerTitle: peer.title,
     peerSource: peer.source,
     sharedTerms: sharedTerms.slice(0, 5),

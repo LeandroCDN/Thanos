@@ -9,6 +9,8 @@ interface MarketModalProps {
   onAddInterested: () => void;
   onRemoveInterested: () => void;
   onClose: () => void;
+  onWhitelistPair?: (poly: Market, kalshi: Market) => void;
+  whitelistedPairIds?: Set<string>;
 }
 
 export function MarketModal({
@@ -19,6 +21,8 @@ export function MarketModal({
   onAddInterested,
   onRemoveInterested,
   onClose,
+  onWhitelistPair,
+  whitelistedPairIds,
 }: MarketModalProps) {
   const key = getMarketKey(market);
   const match = suggestedMatches[key];
@@ -85,7 +89,12 @@ export function MarketModal({
             </h3>
             <div className="space-y-2">
               {counterparts.map((cp) => {
-                const edge = computeEdge(market, cp);
+                const poly = market.source === "polymarket" ? market : cp;
+                const kalshi = market.source === "kalshi" ? market : cp;
+                const edge = computeEdge(poly, kalshi);
+                const pairId = `${poly.id}::${kalshi.id}`;
+                const alreadyWhitelisted = whitelistedPairIds?.has(pairId) ?? false;
+
                 return (
                   <div
                     key={`${cp.source}:${cp.id}`}
@@ -95,7 +104,7 @@ export function MarketModal({
                       <div className="text-gray-200 truncate">{cp.title}</div>
                       <div className="text-[11px] text-gray-500 uppercase">{cp.source}</div>
                     </div>
-                    <div className="flex items-center gap-3 shrink-0">
+                    <div className="flex items-center gap-2 shrink-0">
                       <div className="text-right">
                         <div className="text-green-400 text-xs">Y: ${cp.yes_bid?.toFixed(2) ?? "—"} / ${cp.yes_ask?.toFixed(2) ?? "—"}</div>
                         <div className="text-red-400 text-xs">N: ${cp.no_bid?.toFixed(2) ?? "—"} / ${cp.no_ask?.toFixed(2) ?? "—"}</div>
@@ -113,6 +122,20 @@ export function MarketModal({
                           {edge > 0 ? "+" : ""}
                           {(edge * 100).toFixed(1)}%
                         </span>
+                      )}
+                      {onWhitelistPair && (
+                        <button
+                          onClick={() => onWhitelistPair(poly, kalshi)}
+                          disabled={alreadyWhitelisted}
+                          className={`text-xs font-semibold px-2 py-1 rounded transition-colors ${
+                            alreadyWhitelisted
+                              ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+                              : "bg-blue-700 hover:bg-blue-600 text-white"
+                          }`}
+                          title={alreadyWhitelisted ? "Already whitelisted" : "Add to whitelist"}
+                        >
+                          {alreadyWhitelisted ? "✓" : "WHITELIST"}
+                        </button>
                       )}
                     </div>
                   </div>
@@ -174,13 +197,37 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function computeEdge(market: Market, counterpart: Market): number | null {
-  const myYesBid = market.yes_bid || 0;
-  const cpNoBid = counterpart.no_bid || 0;
+function getFees(): { polyFee: number; kalshiFee: number } {
+  try {
+    return { polyFee: 0.02, kalshiFee: 0.07, ...JSON.parse(localStorage.getItem("thanos:fees") ?? "{}") };
+  } catch {
+    return { polyFee: 0.02, kalshiFee: 0.07 };
+  }
+}
 
-  if (myYesBid <= 0 && cpNoBid <= 0) return null;
+function computeEdge(poly: Market, kalshi: Market): number | null {
+  const { polyFee, kalshiFee } = getFees();
 
-  return 1 - myYesBid - cpNoBid;
+  let edgeA: number | null = null;
+  let edgeB: number | null = null;
+
+  // Direction A: buy YES on Polymarket + buy NO on Kalshi
+  if (poly.yes_ask > 0 && kalshi.no_ask > 0) {
+    const polyEff   = poly.yes_ask * (1 + polyFee);
+    const kalshiEff = kalshi.no_ask + kalshiFee * kalshi.no_ask * (1 - kalshi.no_ask);
+    edgeA = 1 - polyEff - kalshiEff;
+  }
+  // Direction B: buy YES on Kalshi + buy NO on Polymarket
+  if (kalshi.yes_ask > 0 && poly.no_ask > 0) {
+    const kalshiEff = kalshi.yes_ask + kalshiFee * kalshi.yes_ask * (1 - kalshi.yes_ask);
+    const polyEff   = poly.no_ask * (1 + polyFee);
+    edgeB = 1 - kalshiEff - polyEff;
+  }
+
+  if (edgeA === null && edgeB === null) return null;
+  if (edgeA === null) return edgeB;
+  if (edgeB === null) return edgeA;
+  return Math.max(edgeA, edgeB);
 }
 
 function formatVolume(vol: number): string {
