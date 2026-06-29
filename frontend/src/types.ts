@@ -80,6 +80,9 @@ export interface ArbitragePosition {
   status: "open" | "closed";
   closedAt?: string;
   realizedPnl?: number;
+  source?: "manual" | "bot";
+  executionMode?: "paper" | "live";
+  closeReason?: string;
 }
 
 export interface MarketFilters {
@@ -88,4 +91,83 @@ export interface MarketFilters {
   volumeMin: number;
   liquidityMin: number;
   maxPages: number;
+}
+
+export type BotMode = "off" | "test" | "on";
+
+export interface BotSettings {
+  mode: BotMode;
+  scan_interval_seconds: number;
+  open_enabled: boolean;
+  close_enabled: boolean;
+  min_net_edge: number;
+  max_leg_slippage: number;
+  fixed_trade_dollars: number;
+  max_total_capital: number;
+  max_open_positions: number;
+  min_hours_to_close: number;
+  poly_fee: number;
+  kalshi_fee: number;
+  take_profit_enabled: boolean;
+  take_profit_pct: number;
+  stop_loss_enabled: boolean;
+  stop_loss_pct: number;
+  close_before_close_enabled: boolean;
+  close_before_close_hours: number;
+  edge_reversion_enabled: boolean;
+  close_edge_below_pct: number;
+  min_close_profit_pct: number;
+  max_daily_loss: number;
+  max_daily_trades: number;
+  max_consecutive_failures: number;
+  stop_on_api_error: boolean;
+  telegram_enabled: boolean;
+  telegram_bot_token: string;
+  telegram_chat_id: string;
+  telegramConfigured?: boolean;
+  notify_bot_status: boolean;
+  notify_trade_opened: boolean;
+  notify_trade_closed: boolean;
+  notify_trade_failed: boolean;
+  notify_circuit_breaker: boolean;
+}
+
+export interface BotLog {
+  id: number;
+  createdAt: string;
+  level: "info" | "warning" | "error" | string;
+  eventType: string;
+  message: string;
+  data: Record<string, unknown>;
+}
+
+export interface BotSummary {
+  trigger?: string;
+  mode?: BotMode;
+  allowExecute?: boolean;
+  pairsScanned?: number;
+  eligibleCount?: number;
+  rejectedCount?: number;
+  openedCount?: number;
+  closedCount?: number;
+  errorCount?: number;
+  openPositions?: number;
+  rejections?: Array<{ id: string; code: string; message: string; data?: Record<string, unknown> }>;
+  eligible?: Array<Record<string, unknown>>;
+  executions?: Array<Record<string, unknown>>;
+  errors?: Array<Record<string, unknown>>;
+}
+
+export interface BotStatus {
+  running: boolean;
+  scanning: boolean;
+  warmupComplete: boolean;
+  settings: BotSettings;
+  lastScanAt?: string;
+  nextScanAt?: string | null;
+  lastSummary: BotSummary;
+  recentLogs: BotLog[];
+  dailyTradeCount: number;
+  dailyRealizedPnl: number;
+  consecutiveFailures: number;
 }

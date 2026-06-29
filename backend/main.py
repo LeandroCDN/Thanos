@@ -3,14 +3,17 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Any
 
 import asyncio
 import httpx
+from bot_engine import BotModeRequest, BotSettingsUpdate, bot_controller
 from polymarket import fetch_all_markets as fetch_polymarket, fetch_markets_by_ids as fetch_poly_by_ids, fetch_balance as fetch_poly_balance
 from kalshi import BASE_URL as KALSHI_BASE_URL, _build_auth_headers as kalshi_auth_headers, fetch_all_markets as fetch_kalshi, fetch_markets_by_tickers as fetch_kalshi_by_tickers, fetch_balance as fetch_kalshi_balance
 from depth import analyse_depth
 from cache import cache
-from trading import EXECUTION_VERSION, OpenTradeRequest, execute_open_trade
+from store import store
+from trading import EXECUTION_VERSION, CloseTradeRequest, OpenTradeRequest, execute_close_trade, execute_open_trade
 
 app = FastAPI(title="Thanos - Arb Market Explorer")
 
@@ -21,6 +24,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    await bot_controller.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await bot_controller.shutdown()
 
 
 @app.get("/api/markets/polymarket")
@@ -154,6 +167,72 @@ async def get_balances():
     return {"polymarket": poly, "kalshi": kalshi}
 
 
+@app.get("/api/whitelist")
+async def list_whitelist():
+    return {"pairs": store.list_whitelisted_pairs()}
+
+
+@app.post("/api/whitelist")
+async def add_whitelist_pair(pair: dict[str, Any]):
+    try:
+        saved = store.upsert_whitelisted_pair(pair)
+        return {"pair": saved, "pairs": store.list_whitelisted_pairs()}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/whitelist/import")
+async def import_whitelist(payload: dict[str, Any]):
+    pairs = payload.get("pairs") if isinstance(payload, dict) else None
+    if not isinstance(pairs, list):
+        raise HTTPException(status_code=400, detail="Expected body: { pairs: [...] }")
+    return {"pairs": store.import_whitelisted_pairs(pairs)}
+
+
+@app.delete("/api/whitelist/{pair_id}")
+async def delete_whitelist_pair(pair_id: str):
+    store.delete_whitelisted_pair(pair_id)
+    return {"status": "ok", "pairs": store.list_whitelisted_pairs()}
+
+
+@app.get("/api/positions")
+async def list_positions():
+    return {"positions": store.list_positions()}
+
+
+@app.post("/api/positions")
+async def add_position(position: dict[str, Any]):
+    try:
+        saved = store.upsert_position(position)
+        return {"position": saved, "positions": store.list_positions()}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/positions/import")
+async def import_positions(payload: dict[str, Any]):
+    positions = payload.get("positions") if isinstance(payload, dict) else None
+    if not isinstance(positions, list):
+        raise HTTPException(status_code=400, detail="Expected body: { positions: [...] }")
+    return {"positions": store.import_positions(positions)}
+
+
+@app.delete("/api/positions/{position_id}")
+async def delete_position(position_id: str):
+    store.delete_position(position_id)
+    return {"status": "ok", "positions": store.list_positions()}
+
+
+@app.post("/api/positions/{position_id}/close")
+async def mark_position_closed(position_id: str, payload: dict[str, Any]):
+    realized = float(payload.get("realizedPnl") or 0)
+    reason = str(payload.get("reason") or "manual")
+    closed = store.close_position(position_id, realized, reason)
+    if not closed:
+        raise HTTPException(status_code=404, detail="Position not found")
+    return {"position": closed, "positions": store.list_positions()}
+
+
 @app.post("/api/trades/open")
 async def open_trade(req: OpenTradeRequest):
     """
@@ -175,9 +254,57 @@ async def open_trade(req: OpenTradeRequest):
         ) from exc
 
 
+@app.post("/api/trades/close")
+async def close_trade(req: CloseTradeRequest):
+    """
+    Close a live arb position by selling both legs with FOK marketable orders.
+    Bid caps are supplied by the caller and checked again immediately before
+    execution.
+    """
+    try:
+        return await execute_close_trade(req)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": str(exc),
+                "execution_version": EXECUTION_VERSION,
+            },
+        ) from exc
+
+
 @app.get("/api/trades/status")
 async def trades_status():
     return {"execution_version": EXECUTION_VERSION}
+
+
+@app.get("/api/bot/status")
+async def get_bot_status():
+    return bot_controller.status()
+
+
+@app.patch("/api/bot/settings")
+async def update_bot_settings(update: BotSettingsUpdate):
+    return bot_controller.update_settings(update)
+
+
+@app.post("/api/bot/mode")
+async def set_bot_mode(req: BotModeRequest):
+    return await bot_controller.set_mode(req.mode)
+
+
+@app.post("/api/bot/scan")
+async def run_bot_scan():
+    summary = await bot_controller.scan_once("manual")
+    return {"summary": summary, "status": bot_controller.status()}
+
+
+@app.post("/api/bot/telegram/test")
+async def test_bot_telegram():
+    try:
+        return await bot_controller.send_test_telegram()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/diagnostics/kalshi")

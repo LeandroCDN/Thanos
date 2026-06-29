@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 import kalshi as kalshi_data
 import polymarket as poly_data
 
-EXECUTION_VERSION = "open-v4-simple-fok"
+EXECUTION_VERSION = "open-close-v5-fok-bot"
 
 
 class OpenTradeRequest(BaseModel):
@@ -26,6 +26,19 @@ class OpenTradeRequest(BaseModel):
     max_poly_price: Decimal = Field(gt=0, lt=1)
     max_kalshi_price: Decimal = Field(gt=0, lt=1)
     max_total_cost: Decimal = Field(gt=0)
+    first_venue: Literal["auto", "polymarket", "kalshi"] = "auto"
+
+
+class CloseTradeRequest(BaseModel):
+    poly_id: str
+    kalshi_id: str
+    poly_action: Literal["YES", "NO"]
+    kalshi_action: Literal["YES", "NO"]
+    contracts: Decimal = Field(gt=0)
+    min_poly_price: Decimal = Field(gt=0, lt=1)
+    min_kalshi_price: Decimal = Field(gt=0, lt=1)
+    min_total_proceeds: Decimal = Field(ge=0)
+    first_venue: Literal["auto", "polymarket", "kalshi"] = "auto"
 
 
 def _money(value: Decimal) -> Decimal:
@@ -50,6 +63,18 @@ async def execute_open_trade(req: OpenTradeRequest) -> dict:
     if not kalshi_markets:
         raise ValueError(f"Kalshi market not found: {req.kalshi_id}")
     return await asyncio.to_thread(_execute_open_trade_sync, req, poly_markets[0], kalshi_markets[0])
+
+
+async def execute_close_trade(req: CloseTradeRequest) -> dict:
+    poly_markets, kalshi_markets = await asyncio.gather(
+        poly_data.fetch_markets_by_ids([req.poly_id]),
+        kalshi_data.fetch_markets_by_tickers([req.kalshi_id]),
+    )
+    if not poly_markets:
+        raise ValueError(f"Polymarket market not found: {req.poly_id}")
+    if not kalshi_markets:
+        raise ValueError(f"Kalshi market not found: {req.kalshi_id}")
+    return await asyncio.to_thread(_execute_close_trade_sync, req, poly_markets[0], kalshi_markets[0])
 
 
 def _execute_open_trade_sync(req: OpenTradeRequest, poly_market: dict, kalshi_market: dict) -> dict:
@@ -87,26 +112,57 @@ def _execute_open_trade_sync(req: OpenTradeRequest, poly_market: dict, kalshi_ma
     if max_poly_spend < poly_spend:
         raise ValueError(f"Polymarket spend cap {max_poly_spend} is below required spend {poly_spend}")
 
-    poly_result = _place_poly_buy(
-        req.poly_id,
-        req.poly_action,
-        contracts,
-        poly_spend,
-        poly_ask,
-        max_poly_spend,
-    )
-    try:
-        kalshi_result = _place_kalshi_buy(req.kalshi_id, req.kalshi_action, contracts, kalshi_ask)
-    except Exception as exc:
-        unwind = _try_unwind_poly(req.poly_id, req.poly_action, contracts)
-        raise RuntimeError(
-            f"Kalshi leg failed after Polymarket fill: {exc}. "
-            f"Polymarket unwind attempted: {unwind}"
-        ) from exc
+    first_venue = _resolve_first_venue(req.first_venue, poly_market, kalshi_market)
+
+    if first_venue == "polymarket":
+        poly_result = _place_poly_buy(
+            req.poly_id,
+            req.poly_action,
+            contracts,
+            poly_spend,
+            poly_ask,
+            max_poly_spend,
+        )
+        try:
+            kalshi_result = _place_kalshi_buy(
+                req.kalshi_id,
+                req.kalshi_action,
+                contracts,
+                req.max_kalshi_price,
+            )
+        except Exception as exc:
+            unwind = _try_unwind_poly(req.poly_id, req.poly_action, contracts)
+            raise RuntimeError(
+                f"Kalshi leg failed after Polymarket fill: {exc}. "
+                f"Polymarket unwind attempted: {unwind}"
+            ) from exc
+    else:
+        kalshi_result = _place_kalshi_buy(
+            req.kalshi_id,
+            req.kalshi_action,
+            contracts,
+            req.max_kalshi_price,
+        )
+        try:
+            poly_result = _place_poly_buy(
+                req.poly_id,
+                req.poly_action,
+                contracts,
+                poly_spend,
+                poly_ask,
+                max_poly_spend,
+            )
+        except Exception as exc:
+            unwind = _try_unwind_kalshi(req.kalshi_id, req.kalshi_action, contracts)
+            raise RuntimeError(
+                f"Polymarket leg failed after Kalshi fill: {exc}. "
+                f"Kalshi unwind attempted: {unwind}"
+            ) from exc
 
     return {
         "status": "opened",
         "execution_version": EXECUTION_VERSION,
+        "first_venue": first_venue,
         "contracts": str(contracts),
         "poly": {
             "market_id": req.poly_id,
@@ -124,6 +180,80 @@ def _execute_open_trade_sync(req: OpenTradeRequest, poly_market: dict, kalshi_ma
         },
         "gross_spend": str(total_spend),
     }
+
+
+def _execute_close_trade_sync(req: CloseTradeRequest, poly_market: dict, kalshi_market: dict) -> dict:
+    contracts = _count(req.contracts)
+    if contracts <= 0:
+        raise ValueError("Trade size rounds below 1 whole contract")
+
+    poly_bid = _side_bid(poly_market, req.poly_action)
+    kalshi_bid = _side_bid(kalshi_market, req.kalshi_action)
+    if poly_bid <= 0:
+        raise ValueError(f"Polymarket {req.poly_action} bid is unavailable")
+    if kalshi_bid <= 0:
+        raise ValueError(f"Kalshi {req.kalshi_action} bid is unavailable")
+    if poly_bid < req.min_poly_price:
+        raise ValueError(f"Polymarket {req.poly_action} bid moved to {poly_bid}, below min {req.min_poly_price}")
+    if kalshi_bid < req.min_kalshi_price:
+        raise ValueError(f"Kalshi {req.kalshi_action} bid moved to {kalshi_bid}, below min {req.min_kalshi_price}")
+
+    poly_proceeds = _money(contracts * poly_bid)
+    kalshi_proceeds = _money(contracts * kalshi_bid)
+    total_proceeds = poly_proceeds + kalshi_proceeds
+    if total_proceeds < req.min_total_proceeds:
+        raise ValueError(f"Current gross proceeds {total_proceeds} below min {req.min_total_proceeds}")
+
+    first_venue = _resolve_first_venue(req.first_venue, poly_market, kalshi_market)
+
+    if first_venue == "polymarket":
+        poly_result = _place_poly_sell(req.poly_id, req.poly_action, contracts, req.min_poly_price)
+        try:
+            kalshi_result = _place_kalshi_sell(req.kalshi_id, req.kalshi_action, contracts, req.min_kalshi_price)
+        except Exception as exc:
+            raise RuntimeError(f"Kalshi close leg failed after Polymarket close fill: {exc}") from exc
+    else:
+        kalshi_result = _place_kalshi_sell(req.kalshi_id, req.kalshi_action, contracts, req.min_kalshi_price)
+        try:
+            poly_result = _place_poly_sell(req.poly_id, req.poly_action, contracts, req.min_poly_price)
+        except Exception as exc:
+            raise RuntimeError(f"Polymarket close leg failed after Kalshi close fill: {exc}") from exc
+
+    return {
+        "status": "closed",
+        "execution_version": EXECUTION_VERSION,
+        "first_venue": first_venue,
+        "contracts": str(contracts),
+        "poly": {
+            "market_id": req.poly_id,
+            "action": req.poly_action,
+            "price": str(poly_bid),
+            "gross_proceeds": str(poly_proceeds),
+            "order": poly_result,
+        },
+        "kalshi": {
+            "ticker": req.kalshi_id,
+            "action": req.kalshi_action,
+            "price": str(kalshi_bid),
+            "gross_proceeds": str(kalshi_proceeds),
+            "order": kalshi_result,
+        },
+        "gross_proceeds": str(total_proceeds),
+    }
+
+
+def _resolve_first_venue(first_venue: str, poly_market: dict, kalshi_market: dict) -> str:
+    if first_venue in ("polymarket", "kalshi"):
+        return first_venue
+    poly_liq = Decimal(str(poly_market.get("liquidity") or "0"))
+    kalshi_liq = Decimal(str(kalshi_market.get("liquidity") or "0"))
+    if poly_liq <= 0 and kalshi_liq <= 0:
+        return "polymarket"
+    if poly_liq <= 0:
+        return "polymarket"
+    if kalshi_liq <= 0:
+        return "kalshi"
+    return "polymarket" if poly_liq <= kalshi_liq else "kalshi"
 
 
 def _side_ask(market: dict, action: str) -> Decimal:
@@ -207,20 +337,37 @@ def _try_unwind_poly(market_id: str, action: str, contracts: Decimal) -> dict:
         min_price = _side_bid(market, action)
         if min_price <= 0:
             return {"ok": False, "error": "no bid available"}
-        sdk = _poly_sdk()
-        private_key, wallet = _poly_credentials()
-        token_id = _poly_token_id(market_id, action)
-        with sdk.SecureClient.create(private_key=private_key, wallet=wallet) as client:
-            result = client.place_market_order(
-                token_id=token_id,
-                side="SELL",
-                shares=str(contracts),
-                min_price=str(_price(min_price)),
-                order_type="FOK",
-            )
-        return _poly_order_response(result)
+        return _place_poly_sell(market_id, action, contracts, min_price)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def _try_unwind_kalshi(ticker: str, action: str, contracts: Decimal) -> dict:
+    try:
+        market = asyncio.run(kalshi_data.fetch_markets_by_tickers([ticker]))[0]
+        min_price = _side_bid(market, action)
+        if min_price <= 0:
+            return {"ok": False, "error": "no bid available"}
+        return _place_kalshi_sell(ticker, action, contracts, min_price)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _place_poly_sell(market_id: str, action: str, contracts: Decimal, min_price: Decimal) -> dict:
+    sdk = _poly_sdk()
+    private_key, wallet = _poly_credentials()
+    token_id = _poly_token_id(market_id, action)
+    with sdk.SecureClient.create(private_key=private_key, wallet=wallet) as client:
+        result = client.place_market_order(
+            token_id=token_id,
+            side="SELL",
+            shares=str(contracts),
+            min_price=str(_price(min_price)),
+            order_type="FOK",
+        )
+    if not result.ok:
+        raise RuntimeError(f"Polymarket sell rejected: {result.code} {result.message}")
+    return _poly_order_response(result, filled_shares=contracts)
 
 
 def _poly_order_response(
@@ -242,13 +389,13 @@ def _poly_order_response(
     }
 
 
-def _place_kalshi_buy(ticker: str, action: str, contracts: Decimal, ask: Decimal) -> dict:
+def _place_kalshi_buy(ticker: str, action: str, contracts: Decimal, limit_price: Decimal) -> dict:
     if action == "YES":
         side = "bid"
-        price = ask
+        price = limit_price
     else:
         side = "ask"
-        price = Decimal("1") - ask
+        price = Decimal("1") - limit_price
 
     payload = {
         "ticker": ticker,
@@ -267,6 +414,34 @@ def _place_kalshi_buy(ticker: str, action: str, contracts: Decimal, ask: Decimal
     fill_count = Decimal(str(verified.get("fill_count_fp") or verified.get("fill_count") or "0"))
     if fill_count < contracts:
         raise RuntimeError(f"Kalshi FOK did not fully fill: {verified}")
+    return verified
+
+
+def _place_kalshi_sell(ticker: str, action: str, contracts: Decimal, min_price: Decimal) -> dict:
+    if action == "YES":
+        side = "ask"
+        price = min_price
+    else:
+        side = "bid"
+        price = Decimal("1") - min_price
+
+    payload = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": side,
+        "count": str(contracts),
+        "price": str(_price(price)),
+        "time_in_force": "fill_or_kill",
+        "self_trade_prevention_type": "taker_at_cross",
+        "post_only": False,
+        "reduce_only": True,
+    }
+    result = _kalshi_order(payload)
+    order_id = result.get("order_id") or result.get("id")
+    verified = _kalshi_lookup_order(order_id) if order_id else result
+    fill_count = Decimal(str(verified.get("fill_count_fp") or verified.get("fill_count") or "0"))
+    if fill_count < contracts:
+        raise RuntimeError(f"Kalshi FOK sell did not fully fill: {verified}")
     return verified
 
 

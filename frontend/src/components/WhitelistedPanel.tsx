@@ -29,7 +29,7 @@ interface FeeConfig {
 const DEFAULT_FEES: FeeConfig = { polyFee: 0.02, kalshiFee: 0.07 };
 const FEE_STORAGE_KEY = "thanos:fees";
 const POLY_MIN_MARKET_BUY_DOLLARS = 1;
-const EXPECTED_EXECUTION_VERSION = "open-v4-simple-fok";
+const EXPECTED_EXECUTION_VERSION = "open-close-v5-fok-bot";
 
 function loadFees(): FeeConfig {
   try {
@@ -277,6 +277,11 @@ export function WhitelistedPanel({
                 const kalshi = marketById(pair.kalshiId, "kalshi");
                 const edgeGross = poly && kalshi ? computeEdge(poly, kalshi, null) : null;
                 const edgeNet = poly && kalshi ? computeEdge(poly, kalshi, fees) : null;
+                const edgeUnavailableReason = !poly
+                  ? "Polymarket live data unavailable for this whitelisted ID"
+                  : !kalshi
+                    ? "Kalshi live data unavailable for this whitelisted ticker"
+                    : "One or both venues have no usable ask prices";
                 const polyEndDate = poly?.end_date ?? "";
                 const kalshiEndDate = kalshi?.end_date ?? "";
                 const betRaw = parseFloat(betSizes[pair.id] ?? "");
@@ -342,7 +347,7 @@ export function WhitelistedPanel({
                           {edgeNet > 0 ? "+" : ""}{(edgeNet * 100).toFixed(1)}%
                         </span>
                       ) : (
-                        <span className="text-gray-600 text-xs">—</span>
+                        <span className="text-gray-600 text-xs cursor-help" title={edgeUnavailableReason}>—</span>
                       )}
                       {edgeGross !== null && edgeNet !== null && (
                         <div className="text-[10px] text-gray-600 mt-0.5 font-mono">
@@ -411,7 +416,7 @@ export function WhitelistedPanel({
                       <button
                         onClick={() => poly && kalshi && handleOpenTrade(pair, poly, kalshi)}
                         disabled={!canOpen}
-                        title={!betValid ? "Enter a bet size first" : !hasEdge ? "No positive edge" : !poly || !kalshi ? "Prices not loaded" : "Preview trade"}
+                        title={!poly || !kalshi ? edgeUnavailableReason : !betValid ? "Enter a bet size first" : !hasEdge ? "No positive edge" : "Preview trade"}
                         className={`px-2 py-1 rounded text-[11px] font-bold tracking-wide transition-colors whitespace-nowrap ${
                           canOpen
                             ? "bg-green-700 hover:bg-green-600 text-white"

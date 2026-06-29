@@ -30,6 +30,9 @@ Thumbs.db
 # Bot data
 bot/*.sqlite
 bot/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db
 
 # Logs
 *.log

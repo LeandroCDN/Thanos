@@ -217,6 +217,7 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
                   : null;
                 const endDate = pos.polyEndDate || pos.kalshiEndDate;
                 const isRefreshing = refreshing[pos.id];
+                const isPaper = pos.executionMode === "paper";
 
                 return (
                   <tr key={pos.id} className="hover:bg-gray-800/30 transition-colors">
@@ -233,6 +234,23 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
                         title={pos.kalshiTitle}
                       >
                         {pos.kalshiTitle}
+                      </div>
+                      <div className="mt-1 flex items-center gap-1.5">
+                        <span
+                          className={`rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-wide ${
+                            isPaper
+                              ? "border-yellow-700 bg-yellow-950/40 text-yellow-200"
+                              : "border-red-800 bg-red-950/40 text-red-200"
+                          }`}
+                          title={isPaper ? "Paper/test position. Does not represent live exchange exposure." : "Live/dashboard position."}
+                        >
+                          {isPaper ? "TEST" : "LIVE"}
+                        </span>
+                        {pos.source === "bot" && (
+                          <span className="rounded border border-blue-900 bg-blue-950/30 px-1.5 py-0.5 text-[9px] font-bold tracking-wide text-blue-200">
+                            BOT
+                          </span>
+                        )}
                       </div>
                     </td>
 

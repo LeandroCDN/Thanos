@@ -8,6 +8,7 @@ import { MarketModal } from "./components/MarketModal";
 import { FilterBar } from "./components/FilterBar";
 import { WhitelistedPanel } from "./components/WhitelistedPanel";
 import { PositionsPanel } from "./components/PositionsPanel";
+import { BotPanel } from "./components/BotPanel";
 import { findSuggestedMatches } from "./utils/marketMatcher";
 import type { Market, MarketFilters, MarketMatchMap } from "./types";
 
@@ -123,6 +124,8 @@ export default function App() {
           positions={positions}
           onRemove={removePosition}
         />
+
+        <BotPanel />
 
         {error && (
           <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg text-red-300 text-sm">

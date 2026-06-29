@@ -158,13 +158,45 @@ async def fetch_markets_by_ids(ids: list[str]) -> list[dict]:
     if not ids:
         return []
     import asyncio as _asyncio
+
+    # Gamma silently truncates large repeated-id queries. Keep requests small,
+    # then retry any missing IDs one-by-one so whitelisted rows do not randomly
+    # lose Polymarket prices when the list grows.
+    unique_ids = []
+    for market_id in ids:
+        if market_id and market_id not in unique_ids:
+            unique_ids.append(market_id)
+
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # Step 1: get metadata from Gamma API
-        params = [("id", i) for i in ids]
-        resp = await client.get(MARKETS_ENDPOINT, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list):
+        async def fetch_raw_batch(batch: list[str]) -> list[dict]:
+            params = [("id", i) for i in batch]
+            resp = await client.get(MARKETS_ENDPOINT, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+
+        raw_markets: dict[str, dict] = {}
+        for i in range(0, len(unique_ids), 10):
+            for raw in await fetch_raw_batch(unique_ids[i:i + 10]):
+                raw_id = str(raw.get("id", ""))
+                if raw_id:
+                    raw_markets[raw_id] = raw
+
+        missing_ids = [market_id for market_id in unique_ids if market_id not in raw_markets]
+        if missing_ids:
+            individual_results = await _asyncio.gather(
+                *[fetch_raw_batch([market_id]) for market_id in missing_ids],
+                return_exceptions=True,
+            )
+            for result in individual_results:
+                if isinstance(result, Exception):
+                    continue
+                for raw in result:
+                    raw_id = str(raw.get("id", ""))
+                    if raw_id:
+                        raw_markets[raw_id] = raw
+
+        if not raw_markets:
             return []
 
         # Step 2: enrich with live CLOB prices concurrently
@@ -196,7 +228,8 @@ async def fetch_markets_by_ids(ids: list[str]) -> list[dict]:
                     market["no_ask"] = no_ask
             return market
 
-        return list(await _asyncio.gather(*[enrich(raw) for raw in data]))
+        enriched = await _asyncio.gather(*[enrich(raw_markets[market_id]) for market_id in unique_ids if market_id in raw_markets])
+        return list(enriched)
 
 
 async def fetch_all_markets(

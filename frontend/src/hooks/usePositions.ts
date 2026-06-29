@@ -1,73 +1,92 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { ArbitragePosition } from "../types";
 
-const STORAGE_KEY = "thanos:positions";
+const LEGACY_STORAGE_KEY = "thanos:positions";
+const MIGRATED_KEY = "thanos:positions:migrated";
 
-type Listener = () => void;
-const listeners = new Set<Listener>();
-let cachedSnapshot: ArbitragePosition[] = readFromStorage();
-
-function readFromStorage(): ArbitragePosition[] {
+function readLegacyPositions(): ArbitragePosition[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY);
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
   }
 }
 
-function emitChange() {
-  cachedSnapshot = readFromStorage();
-  listeners.forEach((fn) => fn());
-}
-
-function getSnapshot(): ArbitragePosition[] {
-  return cachedSnapshot;
-}
-
-function subscribe(listener: Listener) {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
 export function usePositions() {
-  const positions = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const [positions, setPositions] = useState<ArbitragePosition[]>([]);
+
+  const refresh = useCallback(async () => {
+    const res = await fetch("/api/positions");
+    if (!res.ok) return;
+    const data = await res.json();
+    setPositions(data.positions ?? []);
+  }, []);
+
+  useEffect(() => {
+    async function load() {
+      if (localStorage.getItem(MIGRATED_KEY) !== "true") {
+        const legacy = readLegacyPositions();
+        if (legacy.length > 0) {
+          await fetch("/api/positions/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ positions: legacy }),
+          }).catch(() => undefined);
+        }
+        localStorage.setItem(MIGRATED_KEY, "true");
+      }
+      await refresh();
+    }
+    void load();
+  }, [refresh]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
 
   const addPosition = useCallback(
-    (data: Omit<ArbitragePosition, "id" | "addedAt" | "status">) => {
-      const current = readFromStorage();
-      const pos: ArbitragePosition = {
+    async (data: Omit<ArbitragePosition, "id" | "addedAt" | "status">) => {
+      const pos = {
         ...data,
-        id: crypto.randomUUID(),
         addedAt: new Date().toISOString(),
-        status: "open",
+        status: "open" as const,
+        source: data.source ?? "manual",
+        executionMode: data.executionMode ?? "live",
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify([pos, ...current]));
-      emitChange();
+      const res = await fetch("/api/positions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pos),
+      });
+      if (res.ok) {
+        const payload = await res.json();
+        setPositions(payload.positions ?? []);
+      }
     },
     [],
   );
 
-  const removePosition = useCallback((id: string) => {
-    const current = readFromStorage();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(current.filter((p) => p.id !== id)));
-    emitChange();
+  const removePosition = useCallback(async (id: string) => {
+    const res = await fetch(`/api/positions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (res.ok) {
+      const payload = await res.json();
+      setPositions(payload.positions ?? []);
+    }
   }, []);
 
-  const closePosition = useCallback((id: string, realizedPnl: number) => {
-    const current = readFromStorage();
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify(
-        current.map((p) =>
-          p.id === id
-            ? { ...p, status: "closed" as const, closedAt: new Date().toISOString(), realizedPnl }
-            : p,
-        ),
-      ),
-    );
-    emitChange();
+  const closePosition = useCallback(async (id: string, realizedPnl: number) => {
+    const res = await fetch(`/api/positions/${encodeURIComponent(id)}/close`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ realizedPnl, reason: "manual" }),
+    });
+    if (res.ok) {
+      const payload = await res.json();
+      setPositions(payload.positions ?? []);
+    }
   }, []);
 
-  return { positions, addPosition, removePosition, closePosition };
+  return { positions, addPosition, removePosition, closePosition, refresh };
 }
