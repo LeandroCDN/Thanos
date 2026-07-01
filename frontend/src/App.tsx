@@ -23,6 +23,7 @@ const DEFAULT_FILTERS: MarketFilters = {
   maxPages: 50,
 };
 const EMPTY_MATCHES: MarketMatchMap = {};
+const EMPTY_KEY_SET = new Set<string>();
 
 export default function App() {
   const { polymarkets, kalshiMarkets, loading, error, lastRefreshed, fromCache, refresh } =
@@ -92,12 +93,17 @@ export default function App() {
     [allowMultiplePairs, kalshiMarkets, whitelistedMarketKeys],
   );
   const discoveredMatches = useMemo(
-    () => findSuggestedMatches(visiblePolymarkets, visibleKalshiMarkets),
-    [visiblePolymarkets, visibleKalshiMarkets],
+    () => findSuggestedMatches(polymarkets, kalshiMarkets),
+    [polymarkets, kalshiMarkets],
   );
   const suggestedMatches = useMemo(
-    () => excludeSuggestedPairs(discoveredMatches, whitelistedPairIds),
-    [discoveredMatches, whitelistedPairIds],
+    () =>
+      excludeSuggestedPairs(
+        discoveredMatches,
+        whitelistedPairIds,
+        allowMultiplePairs ? EMPTY_KEY_SET : whitelistedMarketKeys,
+      ),
+    [allowMultiplePairs, discoveredMatches, whitelistedMarketKeys, whitelistedPairIds],
   );
   const allMarkets = useMemo(
     () => [...polymarkets, ...kalshiMarkets],
@@ -341,7 +347,8 @@ export default function App() {
           onRemoveInterested={() => remove(selectedMarket.id, selectedMarket.source)}
           onClose={() => setSelectedMarket(null)}
           onWhitelistPair={(poly, kalshi) => {
-            addPair({ id: poly.id, title: poly.title }, { id: kalshi.id, title: kalshi.title });
+            setSelectedMarket(null);
+            void addPair({ id: poly.id, title: poly.title }, { id: kalshi.id, title: kalshi.title });
           }}
           whitelistedPairIds={whitelistedPairIds}
           whitelistedPairs={pairs}

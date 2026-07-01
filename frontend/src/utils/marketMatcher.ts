@@ -224,12 +224,18 @@ export function findSuggestedMatches(
 export function excludeSuggestedPairs(
   matches: MarketMatchMap,
   excludedPairIds: Set<string>,
+  excludedMarketKeys: Set<string> = new Set(),
 ): MarketMatchMap {
-  if (excludedPairIds.size === 0) return matches;
+  if (excludedPairIds.size === 0 && excludedMarketKeys.size === 0) return matches;
 
   const filtered: MarketMatchMap = {};
   for (const [key, match] of Object.entries(matches)) {
-    const candidates = match.candidates.filter((candidate) => !excludedPairIds.has(candidate.pairKey));
+    if (excludedMarketKeys.has(key)) continue;
+
+    const candidates = match.candidates.filter((candidate) => {
+      if (excludedPairIds.has(candidate.pairKey)) return false;
+      return !excludedMarketKeys.has(`${candidate.peerSource}:${candidate.peerId}`);
+    });
     if (candidates.length === 0) continue;
 
     if (candidates.length === match.candidates.length) {
