@@ -9,8 +9,20 @@ interface DepthResult {
   poly_no_levels: number;
   kalshi_yes_levels: number;
   kalshi_no_levels: number;
-  A?: { ideal_bet: number; initial_edge: number; effective_edge: number; slippage: number; max_shares: number; reason?: string };
-  B?: { ideal_bet: number; initial_edge: number; effective_edge: number; slippage: number; max_shares: number; reason?: string };
+  fee_adjusted?: boolean;
+  A?: DepthSide;
+  B?: DepthSide;
+}
+
+interface DepthSide {
+  ideal_bet: number;
+  initial_edge?: number;
+  effective_edge?: number;
+  initial_net_edge?: number;
+  effective_net_edge?: number;
+  slippage?: number;
+  max_shares?: number;
+  reason?: string;
 }
 
 type SortField = "polymarket" | "kalshi" | "edge" | "closes" | "addedAt";
@@ -29,7 +41,7 @@ interface FeeConfig {
 const DEFAULT_FEES: FeeConfig = { polyFee: 0.02, kalshiFee: 0.07 };
 const FEE_STORAGE_KEY = "thanos:fees";
 const POLY_MIN_MARKET_BUY_DOLLARS = 1;
-const EXPECTED_EXECUTION_VERSION = "open-close-v5-fok-bot";
+const EXPECTED_EXECUTION_VERSION = "open-close-v7-depth-guard";
 
 function loadFees(): FeeConfig {
   try {
@@ -76,6 +88,7 @@ interface WhitelistedPanelProps {
   onRemovePair: (pairId: string) => void;
   onRefreshPairs: () => void;
   pairsRefreshing?: boolean;
+  pairsStreamConnected?: boolean;
   onRecordPosition?: (pos: Omit<ArbitragePosition, "id" | "addedAt" | "status">) => void;
 }
 
@@ -89,6 +102,7 @@ export function WhitelistedPanel({
   onRemovePair,
   onRefreshPairs,
   pairsRefreshing = false,
+  pairsStreamConnected = false,
   onRecordPosition,
 }: WhitelistedPanelProps) {
   const canWhitelist = selectedPoly !== null && selectedKalshi !== null;
@@ -159,12 +173,10 @@ export function WhitelistedPanel({
   async function handleScanDepth(pair: WhitelistedPair) {
     setDepthScanning((prev) => ({ ...prev, [pair.id]: true }));
     try {
-      // Threshold = minimum gross edge so net profit > 0 after entry fees.
-      // Approximate at p=0.5 (50¢ market): fee_drag = polyFee×0.5 + kalshiFee×0.5
-      // Add 0.5% safety margin on top.
-      const feeThreshold = fees.polyFee * 0.5 + fees.kalshiFee * 0.5 + 0.005;
+      // Require a small positive net edge after venue-specific fees.
+      const minNetEdge = 0.005;
       const res = await fetch(
-        `/api/markets/depth?poly_id=${encodeURIComponent(pair.polyId)}&kalshi_id=${encodeURIComponent(pair.kalshiId)}&edge_threshold=${feeThreshold.toFixed(4)}`,
+        `/api/markets/depth?poly_id=${encodeURIComponent(pair.polyId)}&kalshi_id=${encodeURIComponent(pair.kalshiId)}&edge_threshold=${minNetEdge.toFixed(4)}&poly_fee=${fees.polyFee.toFixed(4)}&kalshi_fee=${fees.kalshiFee.toFixed(4)}`,
       );
       if (res.ok) {
         const data: DepthResult = await res.json();
@@ -216,6 +228,18 @@ export function WhitelistedPanel({
           )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          {pairs.length > 0 && (
+            <span
+              className={`rounded border px-2 py-1 text-[10px] font-bold ${
+                pairsStreamConnected
+                  ? "border-green-800 bg-green-950/30 text-green-300"
+                  : "border-gray-700 bg-gray-800/50 text-gray-500"
+              }`}
+              title={pairsStreamConnected ? "Whitelisted prices are receiving WebSocket snapshots" : "WebSocket stream disconnected; refresh uses REST fallback"}
+            >
+              WS
+            </span>
+          )}
           <button
             onClick={onRefreshPairs}
             disabled={pairsRefreshing || pairs.length === 0}
@@ -428,10 +452,11 @@ export function WhitelistedPanel({
                     </td>
 
                     {/* Remove */}
-                    <td className="px-2 py-2 text-center">
+                    <td className="px-1 py-2 text-center">
                       <button
                         onClick={() => onRemovePair(pair.id)}
-                        className="text-gray-600 hover:text-red-400 transition-colors text-base leading-none"
+                        aria-label="Remove pair"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded text-xl leading-none text-gray-500 transition-colors hover:bg-red-950/50 hover:text-red-300 focus:outline-none focus:ring-1 focus:ring-red-500"
                         title="Remove pair"
                       >
                         ×
@@ -465,14 +490,17 @@ function DepthBadge({ result }: { result: DepthResult }) {
   const ideal = result.ideal_bet;
 
   if (ideal <= 0) {
+    const label = depthFailureLabel(result);
+    const tooltip = depthFailureTooltip(result);
     return (
-      <span className="text-[10px] text-red-400 font-mono" title="No profitable depth found">
-        shallow
+      <span className="text-[10px] text-red-400 font-mono" title={tooltip}>
+        {label}
       </span>
     );
   }
 
   const slippage = best?.slippage ?? 0;
+  const edge = result.fee_adjusted ? best?.effective_net_edge : best?.effective_edge;
   const levels = result.best_direction === "A"
     ? Math.min(result.poly_yes_levels, result.kalshi_no_levels)
     : Math.min(result.kalshi_yes_levels, result.poly_no_levels);
@@ -486,17 +514,38 @@ function DepthBadge({ result }: { result: DepthResult }) {
 
   const tooltip = [
     `Ideal bet: ${label}`,
+    edge !== undefined ? `${result.fee_adjusted ? "Net" : "Gross"} edge at max: ${(edge * 100).toFixed(2)}%` : "",
     `Slippage at max: ${(slippage * 100).toFixed(2)}%`,
     `Shares: ${best?.max_shares?.toFixed(0) ?? "?"}`,
     `Order book levels: ${levels}`,
     `Direction: ${result.best_direction === "A" ? "YES Poly + NO Kalshi" : "YES Kalshi + NO Poly"}`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   return (
     <span className={`text-[10px] font-mono font-semibold ${color}`} title={tooltip}>
       {label}
     </span>
   );
+}
+
+function depthFailureLabel(result: DepthResult): string {
+  const reasons = [result.A?.reason, result.B?.reason].filter(Boolean).join(" | ").toLowerCase();
+  if (reasons.includes("missing prices")) return "missing";
+  if (reasons.includes("no net edge") || reasons.includes("no edge")) return "no edge";
+  if (reasons.includes("insufficient order book depth")) return "shallow";
+  return "no depth";
+}
+
+function depthFailureTooltip(result: DepthResult): string {
+  const aReason = result.A?.reason ?? "unavailable";
+  const bReason = result.B?.reason ?? "unavailable";
+  return [
+    "No executable depth found.",
+    `A: ${aReason}`,
+    `B: ${bReason}`,
+    `Levels Y/N: Poly ${result.poly_yes_levels}/${result.poly_no_levels}, Kalshi ${result.kalshi_yes_levels}/${result.kalshi_no_levels}`,
+    result.fee_adjusted ? "Threshold is net of configured fees." : "Threshold is gross edge.",
+  ].join("\n");
 }
 
 
@@ -517,6 +566,10 @@ function TradePreviewModal({
   const [executing, setExecuting] = useState(false);
   const [executionError, setExecutionError] = useState<string | null>(null);
   const executableContracts = Math.floor(calc.contracts);
+  const executionCalc = executableContracts > 0
+    ? calcTradeForContracts(calc.direction, calc.polyAsk, calc.kalshiAsk, executableContracts, fees)
+    : null;
+  const displayCalc = executionCalc ?? calc;
   const minPolyContracts = calc.polyAsk > 0 ? Math.ceil(POLY_MIN_MARKET_BUY_DOLLARS / calc.polyAsk) : Infinity;
   const minTotalCost = Number.isFinite(minPolyContracts)
     ? minPolyContracts * (
@@ -528,7 +581,7 @@ function TradePreviewModal({
   const sizeRuleMessage = executableContracts < minPolyContracts
     ? `Minimum for this pair is ${minPolyContracts} contracts, about ${fmtDollar(minTotalCost)} total at current prices.`
     : null;
-  const canExecuteLiveOpen = mode === "open" && !executing && !sizeRuleMessage && !!onRecordPosition;
+  const canExecuteLiveOpen = mode === "open" && !executing && !sizeRuleMessage && !!executionCalc && !!onRecordPosition;
 
   async function executeOpenTrade() {
     if (sizeRuleMessage) {
@@ -556,10 +609,16 @@ function TradePreviewModal({
           kalshi_id: pair.kalshiId,
           poly_action: calc.polyAction,
           kalshi_action: calc.kalshiAction,
-          contracts: calc.contracts,
+          contracts: executableContracts,
           max_poly_price: calc.polyAsk,
           max_kalshi_price: calc.kalshiAsk,
-          max_total_cost: calc.totalCost,
+          max_total_cost: executionCalc?.totalCost ?? calc.totalCost,
+          first_venue: "auto",
+          market_data_max_age_ms: 300,
+          execution_strategy: "sequential",
+          max_leg_slippage: 0.01,
+          liquidity_buffer: 0.75,
+          allow_shrink: true,
         }),
       });
 
@@ -568,11 +627,11 @@ function TradePreviewModal({
         throw new Error(formatTradeError(data?.detail, res.status));
       }
 
-      const openedContracts = Number(data?.contracts ?? calc.contracts);
+      const openedContracts = Number(data?.contracts ?? executableContracts);
       const polyPrice = Number(data?.poly?.price ?? calc.polyAsk);
       const kalshiPrice = Number(data?.kalshi?.price ?? calc.kalshiAsk);
-      const polySpend = Number(data?.poly?.spend ?? calc.polySpend);
-      const kalshiSpend = Number(data?.kalshi?.spend ?? calc.kalshiSpend);
+      const polySpend = Number(data?.poly?.spend ?? openedContracts * polyPrice);
+      const kalshiSpend = Number(data?.kalshi?.spend ?? openedContracts * kalshiPrice);
       const polyFeesPaid = openedContracts * polyPrice * fees.polyFee;
       const kalshiFeesPaid = openedContracts * fees.kalshiFee * kalshiPrice * (1 - kalshiPrice);
       const totalFeesPaid = polyFeesPaid + kalshiFeesPaid;
@@ -665,7 +724,7 @@ function TradePreviewModal({
                   <div className={`text-sm font-bold ${calc.polyAction === "YES" ? "text-green-400" : "text-red-400"}`}>
                     Buy {calc.polyAction}
                   </div>
-                  <div className="text-xs text-gray-400 font-mono">{fmtCent(calc.polyAsk)} ask · ${calc.polySpend.toFixed(2)}</div>
+                  <div className="text-xs text-gray-400 font-mono">{fmtCent(calc.polyAsk)} ask · ${displayCalc.polySpend.toFixed(2)}</div>
                 </div>
               </div>
 
@@ -682,7 +741,7 @@ function TradePreviewModal({
                   <div className={`text-sm font-bold ${calc.kalshiAction === "YES" ? "text-green-400" : "text-red-400"}`}>
                     Buy {calc.kalshiAction}
                   </div>
-                  <div className="text-xs text-gray-400 font-mono">{fmtCent(calc.kalshiAsk)} ask · ${calc.kalshiSpend.toFixed(2)}</div>
+                  <div className="text-xs text-gray-400 font-mono">{fmtCent(calc.kalshiAsk)} ask · ${displayCalc.kalshiSpend.toFixed(2)}</div>
                 </div>
               </div>
             </div>
@@ -697,36 +756,36 @@ function TradePreviewModal({
               </div>
               <div className="flex items-center justify-between">
                 <div className="text-gray-400 text-xs">Total committed</div>
-                <div className="font-bold text-white font-mono">${calc.totalCost.toFixed(2)}</div>
+                <div className="font-bold text-white font-mono">${displayCalc.totalCost.toFixed(2)}</div>
               </div>
               <div className="flex items-center justify-between">
                 <div className="text-gray-400 text-xs">Gross profit (before fees)</div>
                 <div className="text-gray-300 font-mono text-xs">
-                  +${calc.grossProfit.toFixed(2)}&nbsp;
-                  <span className="text-gray-500">({calc.grossProfitPct.toFixed(1)}%)</span>
+                  +${displayCalc.grossProfit.toFixed(2)}&nbsp;
+                  <span className="text-gray-500">({displayCalc.grossProfitPct.toFixed(1)}%)</span>
                 </div>
               </div>
               <div className="flex items-center justify-between border-t border-gray-700 pt-2">
                 <div className="text-gray-400 text-xs">
                   Poly fee (taker, {(fees.polyFee * 100).toFixed(1)}%)
                 </div>
-                <div className="text-red-400 font-mono text-xs">−${calc.polyFeesPaid.toFixed(2)}</div>
+                <div className="text-red-400 font-mono text-xs">−${displayCalc.polyFeesPaid.toFixed(2)}</div>
               </div>
               <div className="flex items-center justify-between">
                 <div className="text-gray-400 text-xs">
                   Kalshi fee (taker, {(fees.kalshiFee * 100).toFixed(1)}% × P×(1−P))
                 </div>
-                <div className="text-red-400 font-mono text-xs">−${calc.kalshiFeesPaid.toFixed(2)}</div>
+                <div className="text-red-400 font-mono text-xs">−${displayCalc.kalshiFeesPaid.toFixed(2)}</div>
               </div>
               <div className="flex items-center justify-between">
                 <div className="text-gray-400 text-xs">Total fees</div>
-                <div className="text-red-400 font-mono text-xs">−${calc.totalFees.toFixed(2)}</div>
+                <div className="text-red-400 font-mono text-xs">−${displayCalc.totalFees.toFixed(2)}</div>
               </div>
               <div className="flex items-center justify-between border-t border-gray-700 pt-2">
                 <div className="text-gray-300 text-xs font-semibold">Net profit</div>
-                <div className={`font-bold font-mono ${calc.netProfit >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {calc.netProfit >= 0 ? "+" : ""}${calc.netProfit.toFixed(2)}&nbsp;
-                  <span className="text-xs">({calc.netProfitPct.toFixed(1)}%)</span>
+                <div className={`font-bold font-mono ${displayCalc.netProfit >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {displayCalc.netProfit >= 0 ? "+" : ""}${displayCalc.netProfit.toFixed(2)}&nbsp;
+                  <span className="text-xs">({displayCalc.netProfitPct.toFixed(1)}%)</span>
                 </div>
               </div>
             </div>
@@ -915,6 +974,44 @@ function calcTrade(poly: Market, kalshi: Market, betSize: number, fees: FeeConfi
   };
 }
 
+function calcTradeForContracts(
+  direction: "A" | "B",
+  polyAsk: number,
+  kalshiAsk: number,
+  contracts: number,
+  fees: FeeConfig,
+): TradeCalc | null {
+  if (contracts <= 0 || polyAsk <= 0 || kalshiAsk <= 0) return null;
+  const kalshiFeeBasis = kalshiAsk * (1 - kalshiAsk);
+  const polyFeesPaid = contracts * polyAsk * fees.polyFee;
+  const kalshiFeesPaid = contracts * fees.kalshiFee * kalshiFeeBasis;
+  const totalFees = polyFeesPaid + kalshiFeesPaid;
+  const polySpend = contracts * polyAsk + polyFeesPaid;
+  const kalshiSpend = contracts * kalshiAsk + kalshiFeesPaid;
+  const totalCost = polySpend + kalshiSpend;
+  const grossProfit = contracts * (1 - polyAsk - kalshiAsk);
+  const netProfit = contracts - totalCost;
+
+  return {
+    direction,
+    polyAction: direction === "A" ? "YES" : "NO",
+    kalshiAction: direction === "A" ? "NO" : "YES",
+    polyAsk,
+    kalshiAsk,
+    contracts,
+    polySpend,
+    kalshiSpend,
+    totalCost,
+    polyFeesPaid,
+    kalshiFeesPaid,
+    totalFees,
+    grossProfit,
+    grossProfitPct: totalCost > 0 ? (grossProfit / totalCost) * 100 : 0,
+    netProfit,
+    netProfitPct: totalCost > 0 ? (netProfit / totalCost) * 100 : 0,
+  };
+}
+
 function fmtCent(value: number): string {
   return `${Math.round(value * 100)}¢`;
 }
@@ -925,15 +1022,28 @@ function fmtDollar(value: number): string {
 }
 
 function formatTradeError(detail: unknown, status: number): string {
-  if (typeof detail === "string") return detail;
+  if (typeof detail === "string") return friendlyTradeMessage(detail, status);
   if (detail && typeof detail === "object") {
     const obj = detail as { message?: unknown; execution_version?: unknown };
-    const message = typeof obj.message === "string" ? obj.message : `Live open rejected with HTTP ${status}`;
+    const message = typeof obj.message === "string"
+      ? friendlyTradeMessage(obj.message, status)
+      : `Live open rejected with HTTP ${status}`;
     return typeof obj.execution_version === "string"
       ? `${message} (${obj.execution_version})`
       : message;
   }
   return `Live open rejected with HTTP ${status}`;
+}
+
+function friendlyTradeMessage(message: string, status: number): string {
+  const lowered = message.toLowerCase();
+  if (lowered.includes("fill_or_kill_insufficient_resting_volume") || lowered.includes("resting volume")) {
+    return "FOK could not fill the whole size at current resting volume. The book moved or thinned; retry with the fresh depth-guarded size.";
+  }
+  if (lowered.includes("fresh order-book depth is too thin") || lowered.includes("fresh depth")) {
+    return message;
+  }
+  return message || `Live open rejected with HTTP ${status}`;
 }
 
 function formatDate(dateStr: string): string {

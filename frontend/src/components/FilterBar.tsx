@@ -7,6 +7,9 @@ interface FilterBarProps {
   onSearchChange: (query: string) => void;
   suggestedMatchingEnabled: boolean;
   onSuggestedMatchingEnabledChange: (enabled: boolean) => void;
+  allowMultiplePairs: boolean;
+  onAllowMultiplePairsChange: (enabled: boolean) => void;
+  hiddenWhitelistedMarketCount: number;
   onRefresh: (forceRefresh?: boolean) => void;
   loading: boolean;
   lastRefreshed: Date | null;
@@ -20,6 +23,9 @@ export function FilterBar({
   onSearchChange,
   suggestedMatchingEnabled,
   onSuggestedMatchingEnabledChange,
+  allowMultiplePairs,
+  onAllowMultiplePairsChange,
+  hiddenWhitelistedMarketCount,
   onRefresh,
   loading,
   lastRefreshed,
@@ -49,6 +55,23 @@ export function FilterBar({
             className="h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
           />
           Suggested matching
+        </label>
+        <label
+          className="inline-flex items-center gap-2 text-sm text-gray-300 select-none"
+          title="Allow markets that are already in a whitelisted pair to remain visible for additional analog pairs"
+        >
+          <input
+            type="checkbox"
+            checked={allowMultiplePairs}
+            onChange={(e) => onAllowMultiplePairsChange(e.target.checked)}
+            className="h-4 w-4 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
+          />
+          Allow multiple pairs
+          {!allowMultiplePairs && hiddenWhitelistedMarketCount > 0 && (
+            <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500">
+              {hiddenWhitelistedMarketCount} hidden
+            </span>
+          )}
         </label>
         <button
           onClick={() => onRefresh(false)}

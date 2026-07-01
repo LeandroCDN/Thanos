@@ -5,3 +5,4 @@ python-dotenv
 cryptography
 py-clob-client
 polymarket-client
+websockets

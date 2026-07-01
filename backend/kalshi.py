@@ -8,6 +8,7 @@ from datetime import datetime
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 BASE_URL = os.getenv("KALSHI_BASE_URL_OVERRIDE", "").strip() or "https://api.elections.kalshi.com/trade-api/v2"
 EVENTS_ENDPOINT = f"{BASE_URL}/events"
+_SIGNING_KEY_CACHE: dict[str, object] = {"secret": "", "private_key": None}
 
 
 def _env(*names: str) -> str:
@@ -89,23 +90,30 @@ def _build_auth_headers(method: str, path: str) -> dict:
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
 
-        # Wrap raw base64 key body in PEM headers if not already present, trying both PKCS#8 and PKCS#1
-        if not secret.startswith("-----"):
-            private_key = None
-            for header, footer in [
-                ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"),
-                ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),
-            ]:
-                try:
-                    pem = f"{header}\n{secret}\n{footer}"
-                    private_key = serialization.load_pem_private_key(pem.encode(), password=None)
-                    break
-                except Exception:
-                    continue
-            if private_key is None:
-                return {}
+        cached_key = _SIGNING_KEY_CACHE.get("private_key")
+        if cached_key is not None and _SIGNING_KEY_CACHE.get("secret") == secret:
+            private_key = cached_key
         else:
-            private_key = serialization.load_pem_private_key(secret.encode(), password=None)
+            # Wrap raw base64 key body in PEM headers if not already present,
+            # trying both PKCS#8 and PKCS#1.
+            if not secret.startswith("-----"):
+                private_key = None
+                for header, footer in [
+                    ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"),
+                    ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),
+                ]:
+                    try:
+                        pem = f"{header}\n{secret}\n{footer}"
+                        private_key = serialization.load_pem_private_key(pem.encode(), password=None)
+                        break
+                    except Exception:
+                        continue
+                if private_key is None:
+                    return {}
+            else:
+                private_key = serialization.load_pem_private_key(secret.encode(), password=None)
+            _SIGNING_KEY_CACHE["secret"] = secret
+            _SIGNING_KEY_CACHE["private_key"] = private_key
         timestamp_ms = str(int(time.time() * 1000))
         msg = (timestamp_ms + method.upper() + path).encode()
 
@@ -135,6 +143,12 @@ def _normalize_market(raw: dict, event_title: str = "", event_category: str = ""
     no_bid = _parse_float(raw.get("no_bid_dollars", 0))
     no_ask = _parse_float(raw.get("no_ask_dollars", 0))
 
+    rules = "\n\n".join(
+        str(raw.get(key) or "").strip()
+        for key in ("rules_primary", "rules_secondary")
+        if str(raw.get(key) or "").strip()
+    )
+
     return {
         "id": ticker,
         "title": title,
@@ -151,7 +165,7 @@ def _normalize_market(raw: dict, event_title: str = "", event_category: str = ""
         "source": "kalshi",
         "url": url,
         "condition_id": ticker,
-        "rules": raw.get("rules_primary", raw.get("rules_secondary", "")),
+        "rules": rules,
         "event_title": event_title or raw.get("event_ticker", ""),
         "outcomes": ["Yes", "No"],
     }

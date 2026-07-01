@@ -14,6 +14,8 @@ DB_PATH = os.getenv("THANOS_DB_PATH", os.path.join(DATA_DIR, "thanos.sqlite3"))
 DEFAULT_BOT_SETTINGS: dict[str, Any] = {
     "mode": "off",
     "scan_interval_seconds": 5,
+    "event_driven": True,
+    "event_debounce_ms": 250,
     "open_enabled": True,
     "close_enabled": True,
     "min_net_edge": 0.05,
@@ -37,6 +39,9 @@ DEFAULT_BOT_SETTINGS: dict[str, Any] = {
     "max_daily_trades": 20,
     "max_consecutive_failures": 3,
     "stop_on_api_error": True,
+    "market_data_max_age_ms": 1000,
+    "balance_cache_seconds": 5,
+    "execution_strategy": "sequential",
     "telegram_enabled": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
@@ -100,6 +105,17 @@ class Store:
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_pair_reviews (
+                    pair_key TEXT PRIMARY KEY,
+                    poly_id TEXT NOT NULL,
+                    kalshi_id TEXT NOT NULL,
+                    rules_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    review_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -340,6 +356,64 @@ class Store:
 
     def set_state(self, key: str, value: Any) -> None:
         self.set_json("bot_state", key, value)
+
+    def get_ai_pair_review(self, pair_key: str, rules_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT review_json
+                FROM ai_pair_reviews
+                WHERE pair_key = ? AND rules_hash = ?
+                """,
+                (pair_key, rules_hash),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["review_json"])
+        except json.JSONDecodeError:
+            return None
+
+    def upsert_ai_pair_review(
+        self,
+        pair_key: str,
+        poly_id: str,
+        kalshi_id: str,
+        rules_hash: str,
+        status: str,
+        review: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        existing = self.get_ai_pair_review(pair_key, rules_hash)
+        created_at = existing.get("createdAt") if existing else now
+        payload = {**review, "createdAt": created_at, "updatedAt": now}
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO ai_pair_reviews
+                    (pair_key, poly_id, kalshi_id, rules_hash, status, review_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pair_key) DO UPDATE SET
+                    poly_id = excluded.poly_id,
+                    kalshi_id = excluded.kalshi_id,
+                    rules_hash = excluded.rules_hash,
+                    status = excluded.status,
+                    review_json = excluded.review_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    pair_key,
+                    poly_id,
+                    kalshi_id,
+                    rules_hash,
+                    status,
+                    json.dumps(payload),
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return payload
 
     @staticmethod
     def _pair_from_row(row: sqlite3.Row) -> dict[str, Any]:

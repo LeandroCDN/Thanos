@@ -52,6 +52,17 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
     const lockedPct = totalCapital > 0 ? (lockedProfit / totalCapital) * 100 : 0;
     return { totalCapital, lockedProfit, lockedPct };
   }, [openPositions]);
+  const liveVenueCapital = useMemo(() => {
+    return openPositions
+      .filter((p) => p.executionMode !== "paper")
+      .reduce(
+        (sum, pos) => ({
+          polymarket: sum.polymarket + (pos.polyCapital ?? 0),
+          kalshi: sum.kalshi + (pos.kalshiCapital ?? 0),
+        }),
+        { polymarket: 0, kalshi: 0 },
+      );
+  }, [openPositions]);
 
   async function fetchBalances() {
     setBalancesLoading(true);
@@ -172,7 +183,7 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
           label="Polymarket"
           color="blue"
           balance={balances.polymarket}
-          invested={totals.totalCapital}
+          invested={liveVenueCapital.polymarket}
           loading={balancesLoading}
         />
         <span className="text-gray-800 text-sm">|</span>
@@ -180,7 +191,7 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
           label="Kalshi"
           color="green"
           balance={balances.kalshi}
-          invested={totals.totalCapital}
+          invested={liveVenueCapital.kalshi}
           loading={balancesLoading}
         />
       </div>
@@ -394,6 +405,7 @@ function BalancePill({
   label,
   color,
   balance,
+  invested = 0,
   loading,
 }: {
   label: string;
@@ -429,9 +441,13 @@ function BalancePill({
     );
   }
 
-  const total     = balance.total     ?? 0;
-  const available = balance.available ?? total;
-  const reserved  = balance.reserved  ?? (total - available);
+  const rawTotal     = balance.total     ?? 0;
+  const available    = balance.available ?? rawTotal;
+  const rawReserved  = balance.reserved  ?? Math.max(0, rawTotal - available);
+  const reportsReserved = rawReserved > 0.01 || rawTotal - available > 0.01;
+  const trackedInvested = Math.max(0, invested);
+  const total = reportsReserved ? rawTotal : rawTotal + trackedInvested;
+  const reserved = reportsReserved ? rawReserved : trackedInvested;
   const hasNote   = !!balance.note;
 
   return (
@@ -458,7 +474,13 @@ function BalancePill({
               <>
                 <span className="text-gray-700">·</span>
                 <span className="text-gray-400">
-                  Invested <span className="text-orange-300 font-mono">${reserved.toFixed(2)}</span>
+                  Invested{" "}
+                  <span
+                    className="text-orange-300 font-mono"
+                    title={reportsReserved ? "Exchange-reported reserved/invested funds" : "Tracked live open-position capital"}
+                  >
+                    ${reserved.toFixed(2)}
+                  </span>
                 </span>
               </>
             )}

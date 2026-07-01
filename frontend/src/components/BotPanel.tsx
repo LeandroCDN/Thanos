@@ -145,6 +145,15 @@ export function BotPanel() {
 
             <SettingsGroup title="Risk">
               <NumberField label="Scan seconds" value={draft.scan_interval_seconds} step={1} onChange={(v) => update("scan_interval_seconds", v)} />
+              <Toggle label="Event driven" checked={draft.event_driven} onChange={(v) => update("event_driven", v)} />
+              <NumberField label="Debounce ms" value={draft.event_debounce_ms} step={50} onChange={(v) => update("event_debounce_ms", Math.floor(v))} />
+              <NumberField label="Data max age ms" value={draft.market_data_max_age_ms} step={100} onChange={(v) => update("market_data_max_age_ms", Math.floor(v))} />
+              <NumberField label="Balance cache s" value={draft.balance_cache_seconds} step={1} onChange={(v) => update("balance_cache_seconds", v)} />
+              <Toggle
+                label="Concurrent FOK"
+                checked={draft.execution_strategy === "concurrent_fok"}
+                onChange={(v) => update("execution_strategy", v ? "concurrent_fok" : "sequential")}
+              />
               <NumberField label="Max capital $" value={draft.max_total_capital} step={100} onChange={(v) => update("max_total_capital", v)} />
               <NumberField label="Max positions" value={draft.max_open_positions} step={1} onChange={(v) => update("max_open_positions", Math.floor(v))} />
               <NumberField label="Daily loss $" value={draft.max_daily_loss} step={10} onChange={(v) => update("max_daily_loss", v)} />
@@ -285,6 +294,8 @@ function LiveConfirmModal({
             <ConfirmMetric label="Max positions" value={String(settings.max_open_positions)} />
             <ConfirmMetric label="Max slippage" value={`${(settings.max_leg_slippage * 100).toFixed(2)}%`} />
             <ConfirmMetric label="Scan interval" value={`${settings.scan_interval_seconds}s`} />
+            <ConfirmMetric label="Decision trigger" value={settings.event_driven ? "WebSocket" : "Scheduled"} />
+            <ConfirmMetric label="Execution" value={settings.execution_strategy === "concurrent_fok" ? "Concurrent FOK" : "Sequential"} />
             <ConfirmMetric label="Open rules" value={settings.open_enabled ? "Enabled" : "Disabled"} />
             <ConfirmMetric label="Close rules" value={settings.close_enabled ? "Enabled" : "Disabled"} />
           </div>

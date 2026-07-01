@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import type { Market, MarketMatchMap } from "../types";
+import type { AiPairReviewMap, Market, MarketMatchMap } from "../types";
 import { getMarketKey } from "../utils/marketMatcher";
+import { aiSortScore, aiTone, bestReviewForMatch } from "../utils/pairRanking";
 
-type SortField = "title" | "yes_bid" | "no_bid" | "volume" | "end_date" | "edge";
-type SortDir = "asc" | "desc";
+export type SortField = "title" | "yes_bid" | "no_bid" | "volume" | "end_date" | "ai" | "edge";
+export type SortDir = "asc" | "desc";
 
 interface MarketTableProps {
   markets: Market[];
@@ -11,10 +12,16 @@ interface MarketTableProps {
   loading: boolean;
   searchQuery: string;
   suggestedMatches: MarketMatchMap;
+  pairReviews: AiPairReviewMap;
   onMarketClick: (market: Market) => void;
   isInterested: (id: string, source: Market["source"]) => boolean;
   selectedId?: string | null;
   onToggleSelect?: (market: Market) => void;
+  sortField?: SortField;
+  sortDir?: SortDir;
+  onSortChange?: (field: SortField, dir: SortDir) => void;
+  alignedOrderKeys?: string[];
+  alignedPeerByKey?: Record<string, string>;
 }
 
 const INITIAL_VISIBLE_ROWS = 250;
@@ -69,11 +76,29 @@ const MATCH_COLORS = [
   },
 ];
 
-export function MarketTable({ markets, allMarkets, loading, searchQuery, suggestedMatches, onMarketClick, isInterested, selectedId, onToggleSelect }: MarketTableProps) {
-  const [sortField, setSortField] = useState<SortField>("volume");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+export function MarketTable({
+  markets,
+  allMarkets,
+  loading,
+  searchQuery,
+  suggestedMatches,
+  pairReviews,
+  onMarketClick,
+  isInterested,
+  selectedId,
+  onToggleSelect,
+  sortField: controlledSortField,
+  sortDir: controlledSortDir,
+  onSortChange,
+  alignedOrderKeys,
+  alignedPeerByKey,
+}: MarketTableProps) {
+  const [localSortField, setLocalSortField] = useState<SortField>("volume");
+  const [localSortDir, setLocalSortDir] = useState<SortDir>("desc");
   const [visibleRowsCount, setVisibleRowsCount] = useState(INITIAL_VISIBLE_ROWS);
   const [localSearch, setLocalSearch] = useState("");
+  const sortField = controlledSortField ?? localSortField;
+  const sortDir = controlledSortDir ?? localSortDir;
 
   useEffect(() => {
     setVisibleRowsCount(INITIAL_VISIBLE_ROWS);
@@ -114,8 +139,24 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
     return map;
   }, [allMarkets]);
 
+  const alignedOrder = useMemo(() => {
+    const map = new Map<string, number>();
+    alignedOrderKeys?.forEach((key, index) => map.set(key, index));
+    return map;
+  }, [alignedOrderKeys]);
+
   const sorted = useMemo(() => {
     return [...filtered].sort((a, b) => {
+      if (sortField === "ai" && alignedOrder.size > 0) {
+        const orderA = alignedOrder.get(a.key);
+        const orderB = alignedOrder.get(b.key);
+        if (orderA !== undefined || orderB !== undefined) {
+          if (orderA === undefined) return 1;
+          if (orderB === undefined) return -1;
+          if (orderA !== orderB) return sortDir === "asc" ? orderB - orderA : orderA - orderB;
+        }
+      }
+
       // Edge sort: bypass grouping, rank all markets by arb edge desc
       if (sortField === "edge") {
         const aMatch = suggestedMatches[a.key];
@@ -125,6 +166,11 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
         const edgeA = aPeer ? computeEdge(a.market, aPeer) ?? -Infinity : -Infinity;
         const edgeB = bPeer ? computeEdge(b.market, bPeer) ?? -Infinity : -Infinity;
         return sortDir === "asc" ? edgeA - edgeB : edgeB - edgeA;
+      }
+      if (sortField === "ai") {
+        const aiA = aiSortScore(suggestedMatches[a.key], pairReviews);
+        const aiB = aiSortScore(suggestedMatches[b.key], pairReviews);
+        return sortDir === "asc" ? aiA - aiB : aiB - aiA;
       }
 
       // Suggested matches are visual hints only; keep the user's selected sort authoritative.
@@ -145,7 +191,7 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
       const scoreB = bMatch?.score ?? 0;
       return scoreB - scoreA;
     });
-  }, [filtered, sortField, sortDir, suggestedMatches, peerById]);
+  }, [filtered, sortField, sortDir, suggestedMatches, pairReviews, peerById, alignedOrder]);
 
   const visibleRows = useMemo(
     () => sorted.slice(0, visibleRowsCount),
@@ -153,11 +199,17 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
   );
 
   function handleSort(field: SortField) {
+    let nextDir: SortDir;
     if (sortField === field) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      nextDir = sortDir === "asc" ? "desc" : "asc";
     } else {
-      setSortField(field);
-      setSortDir("desc");
+      nextDir = "desc";
+    }
+    if (onSortChange) {
+      onSortChange(field, nextDir);
+    } else {
+      setLocalSortField(field);
+      setLocalSortDir(nextDir);
     }
   }
 
@@ -200,37 +252,46 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
           <tr className="border-b border-gray-700 text-left">
             {onToggleSelect && <th className="pl-3 pr-1 py-2 w-[28px]" />}
             <th
-              className="px-3 py-2 cursor-pointer hover:text-white w-[40%]"
+              className="px-3 py-2 cursor-pointer hover:text-white w-[34%]"
               onClick={() => handleSort("title")}
             >
               Title <SortIcon field="title" />
             </th>
             <th
-              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[15%]"
+              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[13%]"
               onClick={() => handleSort("yes_bid")}
             >
               YES <SortIcon field="yes_bid" />
             </th>
             <th
-              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[15%]"
+              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[13%]"
               onClick={() => handleSort("no_bid")}
             >
               NO <SortIcon field="no_bid" />
             </th>
             <th
-              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[15%]"
+              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[12%]"
               onClick={() => handleSort("volume")}
             >
               Volume <SortIcon field="volume" />
             </th>
             <th
-              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[15%]"
+              className="px-3 py-2 cursor-pointer hover:text-white whitespace-nowrap w-[12%]"
               onClick={() => handleSort("end_date")}
             >
               Closes <SortIcon field="end_date" />
             </th>
             <th
-              className={`px-3 py-2 cursor-pointer whitespace-nowrap w-[10%] text-center transition-colors ${
+              className={`px-3 py-2 cursor-pointer whitespace-nowrap w-[8%] text-center transition-colors ${
+                sortField === "ai" ? "text-fuchsia-300" : "text-gray-400 hover:text-white"
+              }`}
+              onClick={() => handleSort("ai")}
+              title="Sort by AI confidence that the best reviewed candidate is a valid analog or inverse pair"
+            >
+              AI <SortIcon field="ai" />
+            </th>
+            <th
+              className={`px-3 py-2 cursor-pointer whitespace-nowrap w-[8%] text-center transition-colors ${
                 sortField === "edge" ? "text-yellow-300" : "text-gray-400 hover:text-white"
               }`}
               onClick={() => handleSort("edge")}
@@ -245,6 +306,7 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
             const market = row.market;
             const match = suggestedMatches[row.key];
             const matchColor = match ? MATCH_COLORS[match.colorIndex] : null;
+            const aiReview = bestReviewForMatch(match, pairReviews);
             const interested = isInterested(market.id, market.source);
 
             const isSelected = selectedId === market.id;
@@ -289,8 +351,11 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
                       {market.title}
                     </span>
                     {match && (
-                      <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${matchColor?.badge}`}>
-                        {Math.round(match.score * 100)}%
+                      <span
+                        className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${matchColor?.badge}`}
+                        title={`${match.candidates.length} broad candidate${match.candidates.length !== 1 ? "s" : ""}; top discovery score ${Math.round(match.score * 100)}%`}
+                      >
+                        {match.candidates.length} opts
                       </span>
                     )}
                   </div>
@@ -308,9 +373,28 @@ export function MarketTable({ markets, allMarkets, loading, searchQuery, suggest
                   {formatDate(market.end_date)}
                 </td>
                 <td className="px-3 py-2 text-center">
+                  {aiReview ? (
+                    <span
+                      className={`text-xs font-mono font-semibold ${aiTone(aiReview)}`}
+                      title={aiReview.summary}
+                    >
+                      {Math.round(aiReview.confidence * 100)}%
+                    </span>
+                  ) : match ? (
+                    <span className="text-[10px] text-gray-600">pending</span>
+                  ) : (
+                    <span className="text-gray-700 text-xs">—</span>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-center">
                   {(() => {
                     const match = suggestedMatches[row.key];
-                    const peer = match ? peerById.get(`${match.peerSource}:${match.peerId}`) : undefined;
+                    const alignedPeerKey = sortField === "ai" ? alignedPeerByKey?.[row.key] : undefined;
+                    const peer = alignedPeerKey
+                      ? peerById.get(alignedPeerKey)
+                      : match
+                        ? peerById.get(`${match.peerSource}:${match.peerId}`)
+                        : undefined;
                     const edge = peer ? computeEdge(market, peer) : null;
                     if (edge === null) return <span className="text-gray-700 text-xs">—</span>;
                     return (

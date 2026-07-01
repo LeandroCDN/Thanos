@@ -18,12 +18,13 @@ from arb_math import (
     position_from_trade,
     side_bid,
 )
-from depth import analyse_depth
+from market_stream import market_stream
 from store import store, utc_now
 from trading import CloseTradeRequest, OpenTradeRequest, execute_close_trade, execute_open_trade
 
 
 BotMode = Literal["off", "test", "on"]
+ExecutionStrategy = Literal["sequential", "concurrent_fok"]
 _UNSET = object()
 
 
@@ -34,6 +35,8 @@ class BotModeRequest(BaseModel):
 class BotSettingsUpdate(BaseModel):
     mode: BotMode | None = None
     scan_interval_seconds: float | None = Field(default=None, ge=1, le=3600)
+    event_driven: bool | None = None
+    event_debounce_ms: int | None = Field(default=None, ge=0, le=5000)
     open_enabled: bool | None = None
     close_enabled: bool | None = None
     min_net_edge: float | None = Field(default=None, ge=0, le=1)
@@ -57,6 +60,9 @@ class BotSettingsUpdate(BaseModel):
     max_daily_trades: int | None = Field(default=None, ge=0)
     max_consecutive_failures: int | None = Field(default=None, ge=0)
     stop_on_api_error: bool | None = None
+    market_data_max_age_ms: int | None = Field(default=None, ge=100, le=60_000)
+    balance_cache_seconds: float | None = Field(default=None, ge=0, le=300)
+    execution_strategy: ExecutionStrategy | None = None
     telegram_enabled: bool | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
@@ -73,6 +79,7 @@ class BotController:
         self._scan_lock = asyncio.Lock()
         self._last_mode: str | None = None
         self._warmup_complete = False
+        self._balance_cache: tuple[float, dict[str, Any]] | None = None
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -105,12 +112,14 @@ class BotController:
             "dailyTradeCount": store.daily_trade_count(),
             "dailyRealizedPnl": store.daily_realized_pnl(),
             "consecutiveFailures": store.get_state("bot_consecutive_failures", 0) or 0,
+            "marketData": market_stream.status(),
         }
 
     async def set_mode(self, mode: BotMode) -> dict[str, Any]:
         settings = store.set_bot_mode(mode)
         self._warmup_complete = False
         store.set_state("bot_warmup_complete", False)
+        store.set_state("bot_consecutive_failures", 0)
         store.log("info", "mode_changed", f"Bot mode set to {mode.upper()}", {"mode": mode})
         await self._notify(settings, "notify_bot_status", f"Bot mode set to {mode.upper()}")
         return self.status()
@@ -122,15 +131,21 @@ class BotController:
         if mode_changed:
             self._warmup_complete = False
             store.set_state("bot_warmup_complete", False)
+            store.set_state("bot_consecutive_failures", 0)
         store.log("info", "settings_updated", "Bot settings updated", {"keys": sorted(updates.keys())})
         return self.status()
 
-    async def scan_once(self, trigger: str = "manual") -> dict[str, Any]:
+    async def scan_once(self, trigger: str = "manual", market_change: dict[str, Any] | None = None) -> dict[str, Any]:
         async with self._scan_lock:
             settings = store.get_bot_settings()
             mode = settings["mode"]
             allow_execute = mode in ("test", "on") and self._warmup_complete
-            summary = await self._run_scan(settings, allow_execute=allow_execute, trigger=trigger)
+            summary = await self._run_scan(
+                settings,
+                allow_execute=allow_execute,
+                trigger=trigger,
+                market_change=market_change,
+            )
             if mode in ("test", "on") and not self._warmup_complete:
                 self._warmup_complete = True
                 store.set_state("bot_warmup_complete", True)
@@ -153,6 +168,9 @@ class BotController:
         return {"status": "sent"}
 
     async def _loop(self) -> None:
+        trigger = "scheduled"
+        market_change: dict[str, Any] | None = None
+        sequence = int(market_stream.status().get("sequence") or 0)
         while True:
             settings = store.get_bot_settings()
             mode = settings["mode"]
@@ -163,16 +181,46 @@ class BotController:
 
             if mode == "off":
                 self._set_runtime(next_scan_at=None)
+                trigger = "scheduled"
+                market_change = None
+                sequence = int(market_stream.status().get("sequence") or sequence)
                 await asyncio.sleep(1)
                 continue
 
-            await self.scan_once("scheduled")
+            await self.scan_once(trigger, market_change=market_change)
             interval = max(1.0, float(settings.get("scan_interval_seconds") or 5))
             next_scan_at = datetime.now(timezone.utc) + timedelta(seconds=interval)
             self._set_runtime(next_scan_at=next_scan_at.isoformat())
-            await asyncio.sleep(interval)
+            if settings.get("event_driven", True):
+                change = await market_stream.wait_for_change_after(sequence, timeout=interval)
+                sequence = int(change.get("sequence") or sequence)
+                if change.get("changed"):
+                    debounce = max(0.0, float(settings.get("event_debounce_ms") or 0) / 1000.0)
+                    if debounce > 0:
+                        await asyncio.sleep(debounce)
+                        extra = await market_stream.wait_for_change_after(sequence, timeout=0)
+                        if extra.get("changed"):
+                            change = self._merge_market_changes(change, extra)
+                            sequence = int(change.get("sequence") or sequence)
+                    trigger = "market_update"
+                    market_change = change
+                else:
+                    trigger = "scheduled"
+                    market_change = None
+            else:
+                await asyncio.sleep(interval)
+                sequence = int(market_stream.status().get("sequence") or sequence)
+                trigger = "scheduled"
+                market_change = None
 
-    async def _run_scan(self, settings: dict[str, Any], *, allow_execute: bool, trigger: str) -> dict[str, Any]:
+    async def _run_scan(
+        self,
+        settings: dict[str, Any],
+        *,
+        allow_execute: bool,
+        trigger: str,
+        market_change: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         started_at = utc_now()
         mode = settings["mode"]
         summary: dict[str, Any] = {
@@ -192,23 +240,30 @@ class BotController:
             "errors": [],
         }
 
-        pairs = store.list_whitelisted_pairs()
-        open_positions = store.list_positions("open")
+        all_pairs = store.list_whitelisted_pairs()
+        all_open_positions = store.list_positions("open")
+        pairs, positions_to_close, targeted = self._scan_scope(all_pairs, all_open_positions, market_change)
         summary["pairsScanned"] = len(pairs)
-        summary["openPositions"] = len(open_positions)
+        summary["totalPairs"] = len(all_pairs)
+        summary["targeted"] = targeted
+        summary["openPositions"] = len(all_open_positions)
+        if targeted:
+            summary["changedPolymarketMarkets"] = len(market_change.get("polyIds", []) if market_change else [])
+            summary["changedKalshiMarkets"] = len(market_change.get("kalshiIds", []) if market_change else [])
 
         if await self._circuit_breaker_hit(settings, summary):
             self._finish_scan(started_at, summary)
             return summary
 
-        poly_ids = sorted({p["polyId"] for p in pairs} | {p["polyId"] for p in open_positions})
-        kalshi_ids = sorted({p["kalshiId"] for p in pairs} | {p["kalshiId"] for p in open_positions})
+        if not pairs and not positions_to_close:
+            self._finish_scan(started_at, summary)
+            return summary
+
+        poly_ids = sorted({p["polyId"] for p in pairs} | {p["polyId"] for p in positions_to_close})
+        kalshi_ids = sorted({p["kalshiId"] for p in pairs} | {p["kalshiId"] for p in positions_to_close})
 
         try:
-            poly_markets, kalshi_markets = await asyncio.gather(
-                poly_data.fetch_markets_by_ids(poly_ids),
-                kalshi_data.fetch_markets_by_tickers(kalshi_ids),
-            )
+            poly_markets, kalshi_markets = await market_stream.get_pair_markets(poly_ids, kalshi_ids)
         except Exception as exc:
             await self._record_error(settings, summary, "market_fetch_failed", str(exc))
             self._finish_scan(started_at, summary)
@@ -217,9 +272,9 @@ class BotController:
         poly_by_id = {m["id"]: m for m in poly_markets}
         kalshi_by_id = {m["id"]: m for m in kalshi_markets}
 
-        await self._evaluate_closes(settings, summary, open_positions, poly_by_id, kalshi_by_id, allow_execute)
-        open_positions = store.list_positions("open")
-        await self._evaluate_opens(settings, summary, pairs, open_positions, poly_by_id, kalshi_by_id, allow_execute)
+        await self._evaluate_closes(settings, summary, positions_to_close, poly_by_id, kalshi_by_id, allow_execute)
+        all_open_positions = store.list_positions("open")
+        await self._evaluate_opens(settings, summary, pairs, all_open_positions, poly_by_id, kalshi_by_id, allow_execute)
 
         self._finish_scan(started_at, summary)
         return summary
@@ -423,6 +478,8 @@ class BotController:
                     max_kalshi_price=Decimal(str(trade["kalshiAsk"])),
                     max_total_cost=Decimal(str(trade["totalCost"])),
                     first_venue="auto",
+                    market_data_max_age_ms=int(settings.get("market_data_max_age_ms") or 1000),
+                    execution_strategy=settings.get("execution_strategy", "sequential"),
                 )
             )
             contracts = float(result.get("contracts") or trade["contracts"])
@@ -489,6 +546,8 @@ class BotController:
                     min_kalshi_price=Decimal(str(kalshi_bid)),
                     min_total_proceeds=Decimal("0"),
                     first_venue="auto",
+                    market_data_max_age_ms=int(settings.get("market_data_max_age_ms") or 1000),
+                    execution_strategy=settings.get("execution_strategy", "sequential"),
                 )
             )
             log_type = "trade_closed"
@@ -562,7 +621,7 @@ class BotController:
         summary: dict[str, Any],
     ) -> bool:
         try:
-            depth = await analyse_depth(
+            depth = await market_stream.analyse_depth(
                 pair["polyId"],
                 pair["kalshiId"],
                 edge_threshold=0,
@@ -586,6 +645,12 @@ class BotController:
         return True
 
     async def _fetch_balances(self, settings: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any] | None:
+        ttl = float(settings.get("balance_cache_seconds") or 0)
+        now = asyncio.get_running_loop().time()
+        if ttl > 0 and self._balance_cache:
+            cached_at, cached_balances = self._balance_cache
+            if now - cached_at <= ttl:
+                return cached_balances
         try:
             poly, kalshi = await asyncio.gather(poly_data.fetch_balance(), kalshi_data.fetch_balance())
         except Exception as exc:
@@ -595,6 +660,8 @@ class BotController:
         if poly.get("error") or kalshi.get("error"):
             await self._record_error(settings, summary, "balance_check_failed", "One or both balances returned errors", balances)
             return None
+        if ttl > 0:
+            self._balance_cache = (now, balances)
         return balances
 
     def _balances_cover(self, balances: dict[str, Any], trade: dict[str, Any]) -> bool:
@@ -726,6 +793,34 @@ class BotController:
                 resp.raise_for_status()
         except Exception as exc:
             store.log("warning", "telegram_failed", f"Telegram notification failed: {exc}", {})
+
+    @staticmethod
+    def _scan_scope(
+        pairs: list[dict[str, Any]],
+        open_positions: list[dict[str, Any]],
+        market_change: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+        if not market_change or market_change.get("all"):
+            return pairs, open_positions, False
+        changed_poly = {str(item) for item in market_change.get("polyIds", [])}
+        changed_kalshi = {str(item) for item in market_change.get("kalshiIds", [])}
+        if not changed_poly and not changed_kalshi:
+            return pairs, open_positions, False
+
+        def touched(item: dict[str, Any]) -> bool:
+            return str(item.get("polyId")) in changed_poly or str(item.get("kalshiId")) in changed_kalshi
+
+        return [pair for pair in pairs if touched(pair)], [pos for pos in open_positions if touched(pos)], True
+
+    @staticmethod
+    def _merge_market_changes(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "changed": bool(first.get("changed") or second.get("changed")),
+            "sequence": max(int(first.get("sequence") or 0), int(second.get("sequence") or 0)),
+            "all": bool(first.get("all") or second.get("all")),
+            "polyIds": sorted({*(first.get("polyIds") or []), *(second.get("polyIds") or [])}),
+            "kalshiIds": sorted({*(first.get("kalshiIds") or []), *(second.get("kalshiIds") or [])}),
+        }
 
     @staticmethod
     def _public_settings(settings: dict[str, Any]) -> dict[str, Any]:

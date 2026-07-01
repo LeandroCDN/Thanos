@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useState } from "react";
 import type { WhitelistedPair } from "../types";
 
 const LEGACY_STORAGE_KEY = "thanos-whitelisted-pairs";
@@ -16,12 +16,16 @@ function readLegacyPairs(): WhitelistedPair[] {
 export function useWhitelistedPairs() {
   const [pairs, setPairs] = useState<WhitelistedPair[]>([]);
 
+  const commitPairs = useCallback((nextPairs: WhitelistedPair[]) => {
+    startTransition(() => setPairs(nextPairs));
+  }, []);
+
   const refresh = useCallback(async () => {
     const res = await fetch("/api/whitelist");
     if (!res.ok) return;
     const data = await res.json();
-    setPairs(data.pairs ?? []);
-  }, []);
+    commitPairs(data.pairs ?? []);
+  }, [commitPairs]);
 
   useEffect(() => {
     async function load() {
@@ -58,19 +62,19 @@ export function useWhitelistedPairs() {
       });
       if (res.ok) {
         const data = await res.json();
-        setPairs(data.pairs ?? []);
+        commitPairs(data.pairs ?? []);
       }
     },
-    [],
+    [commitPairs],
   );
 
   const removePair = useCallback(async (pairId: string) => {
     const res = await fetch(`/api/whitelist/${encodeURIComponent(pairId)}`, { method: "DELETE" });
     if (res.ok) {
       const data = await res.json();
-      setPairs(data.pairs ?? []);
+      commitPairs(data.pairs ?? []);
     }
-  }, []);
+  }, [commitPairs]);
 
   return { pairs, addPair, removePair, refresh };
 }

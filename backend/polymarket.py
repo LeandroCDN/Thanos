@@ -88,6 +88,9 @@ def _normalize_market(raw: dict) -> dict:
         "rules": raw.get("description", ""),
         "event_title": raw.get("groupItemTitle", raw.get("title", "")),
         "outcomes": outcomes_list,
+        "clobTokenIds": [],
+        "yes_token_id": "",
+        "no_token_id": "",
     }
 
 
@@ -214,6 +217,9 @@ async def fetch_markets_by_ids(ids: list[str]) -> list[dict]:
 
             if len(token_ids) >= 2:
                 yes_tok, no_tok = token_ids[0], token_ids[1]
+                market["clobTokenIds"] = [str(yes_tok), str(no_tok)]
+                market["yes_token_id"] = str(yes_tok)
+                market["no_token_id"] = str(no_tok)
                 (yes_bid, yes_ask), (no_bid, no_ask) = await _asyncio.gather(
                     _fetch_clob_prices(client, yes_tok),
                     _fetch_clob_prices(client, no_tok),

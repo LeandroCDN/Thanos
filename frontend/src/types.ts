@@ -17,6 +17,11 @@ export interface Market {
   rules: string;
   event_title: string;
   outcomes: string[];
+  live_source?: "websocket" | "websocket-cache" | "rest-bootstrap" | "rest-fallback" | "rest";
+  live_updated_at?: string;
+  clobTokenIds?: string[];
+  yes_token_id?: string;
+  no_token_id?: string;
 }
 
 export interface SuggestedMatch {
@@ -27,9 +32,40 @@ export interface SuggestedMatch {
   peerTitle: string;
   peerSource: Market["source"];
   sharedTerms: string[];
+  candidates: SuggestedCandidate[];
 }
 
 export type MarketMatchMap = Record<string, SuggestedMatch>;
+
+export interface SuggestedCandidate {
+  pairKey: string;
+  peerId: string;
+  peerTitle: string;
+  peerSource: Market["source"];
+  score: number;
+  tier: "strong" | "possible" | "weak" | "related";
+  reasons: string[];
+  sharedTerms: string[];
+}
+
+export interface AiPairReview {
+  pairKey: string;
+  polyId: string;
+  kalshiId: string;
+  status: "reviewed" | "heuristic" | "pending" | "unconfigured" | "error";
+  verdict: "analog" | "inverse" | "related_not_analog" | "different" | "uncertain";
+  confidence: number;
+  yesMapping: "kalshi_yes" | "kalshi_no" | "unknown";
+  preferred: boolean;
+  summary: string;
+  settlementAnalysis: string;
+  riskFlags: string[];
+  model?: string;
+  reviewedAt?: string;
+  error?: string;
+}
+
+export type AiPairReviewMap = Record<string, AiPairReview>;
 
 export interface MarketsResponse {
   markets: Market[];
@@ -98,6 +134,8 @@ export type BotMode = "off" | "test" | "on";
 export interface BotSettings {
   mode: BotMode;
   scan_interval_seconds: number;
+  event_driven: boolean;
+  event_debounce_ms: number;
   open_enabled: boolean;
   close_enabled: boolean;
   min_net_edge: number;
@@ -121,6 +159,9 @@ export interface BotSettings {
   max_daily_trades: number;
   max_consecutive_failures: number;
   stop_on_api_error: boolean;
+  market_data_max_age_ms: number;
+  balance_cache_seconds: number;
+  execution_strategy: "sequential" | "concurrent_fok";
   telegram_enabled: boolean;
   telegram_bot_token: string;
   telegram_chat_id: string;
@@ -170,4 +211,5 @@ export interface BotStatus {
   dailyTradeCount: number;
   dailyRealizedPnl: number;
   consecutiveFailures: number;
+  marketData?: Record<string, unknown>;
 }

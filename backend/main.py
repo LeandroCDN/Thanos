@@ -1,16 +1,17 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Any
 
 import asyncio
 import httpx
+from ai_pair_review import pair_review_status, review_pair_batch
 from bot_engine import BotModeRequest, BotSettingsUpdate, bot_controller
-from polymarket import fetch_all_markets as fetch_polymarket, fetch_markets_by_ids as fetch_poly_by_ids, fetch_balance as fetch_poly_balance
-from kalshi import BASE_URL as KALSHI_BASE_URL, _build_auth_headers as kalshi_auth_headers, fetch_all_markets as fetch_kalshi, fetch_markets_by_tickers as fetch_kalshi_by_tickers, fetch_balance as fetch_kalshi_balance
-from depth import analyse_depth
+from polymarket import fetch_all_markets as fetch_polymarket, fetch_balance as fetch_poly_balance
+from kalshi import BASE_URL as KALSHI_BASE_URL, _build_auth_headers as kalshi_auth_headers, fetch_all_markets as fetch_kalshi, fetch_balance as fetch_kalshi_balance
+from market_stream import market_stream
 from cache import cache
 from store import store
 from trading import EXECUTION_VERSION, CloseTradeRequest, OpenTradeRequest, execute_close_trade, execute_open_trade
@@ -28,12 +29,14 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    await market_stream.start()
     await bot_controller.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await bot_controller.shutdown()
+    await market_stream.shutdown()
 
 
 @app.get("/api/markets/polymarket")
@@ -133,10 +136,7 @@ async def get_pairs_markets(
     poly_list = [i.strip() for i in poly_ids.split(",") if i.strip()] if poly_ids else []
     kalshi_list = [i.strip() for i in kalshi_ids.split(",") if i.strip()] if kalshi_ids else []
 
-    poly_markets, kalshi_markets = await asyncio.gather(
-        fetch_poly_by_ids(poly_list),
-        fetch_kalshi_by_tickers(kalshi_list),
-    )
+    poly_markets, kalshi_markets = await market_stream.get_pair_markets(poly_list, kalshi_list)
 
     return {
         "polymarket": poly_markets,
@@ -148,16 +148,75 @@ async def get_pairs_markets(
 async def get_market_depth(
     poly_id: str = Query(..., description="Polymarket numeric market ID"),
     kalshi_id: str = Query(..., description="Kalshi market ticker"),
-    edge_threshold: float = Query(default=0.005, description="Min acceptable blended edge after slippage"),
+    edge_threshold: float = Query(default=0.005, description="Min acceptable edge after slippage; net of fees when fees are supplied"),
     max_leg_slippage: float = Query(default=0.01, description="Max price impact per leg (default 1%)"),
     max_bet_dollars: float = Query(default=100_000.0, description="Hard cap on ideal bet in USD"),
+    poly_fee: float = Query(default=0.0, ge=0.0, le=1.0, description="Polymarket taker fee rate"),
+    kalshi_fee: float = Query(default=0.0, ge=0.0, le=1.0, description="Kalshi fee rate applied as rate * P * (1-P)"),
 ):
     """
     Analyse order-book depth for an arb pair and return the ideal bet size —
     the maximum $ that can be deployed before per-leg slippage exceeds max_leg_slippage
     or the blended edge drops below edge_threshold, whichever comes first.
     """
-    return await analyse_depth(poly_id, kalshi_id, edge_threshold, max_leg_slippage, max_bet_dollars)
+    return await market_stream.analyse_depth(
+        poly_id,
+        kalshi_id,
+        edge_threshold,
+        max_leg_slippage,
+        max_bet_dollars,
+        poly_fee,
+        kalshi_fee,
+    )
+
+
+@app.get("/api/market-data/status")
+async def get_market_data_status():
+    return market_stream.status()
+
+
+@app.post("/api/ai/pair-reviews/batch")
+async def review_pair_candidates(payload: dict[str, Any]):
+    try:
+        return await review_pair_batch(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ai/status")
+async def get_ai_status():
+    return pair_review_status()
+
+
+@app.websocket("/ws/markets")
+async def markets_websocket(websocket: WebSocket):
+    await websocket.accept()
+    poly_ids: list[str] = []
+    kalshi_ids: list[str] = []
+    sequence = -1
+    await websocket.send_json({"type": "ready", "stream": market_stream.status()})
+
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+                if message.get("type") == "subscribe":
+                    poly_ids = [str(i) for i in message.get("polyIds", []) if i]
+                    kalshi_ids = [str(i) for i in message.get("kalshiIds", []) if i]
+                    await market_stream.ensure_targets(poly_ids, kalshi_ids)
+                    snapshot = await market_stream.snapshot(poly_ids, kalshi_ids)
+                    sequence = int(snapshot.get("sequence", sequence))
+                    await websocket.send_json(snapshot)
+            except asyncio.TimeoutError:
+                pass
+
+            next_sequence = await market_stream.wait_for_update_after(sequence, timeout=0.5)
+            if next_sequence != sequence:
+                sequence = next_sequence
+                if poly_ids or kalshi_ids:
+                    await websocket.send_json(await market_stream.snapshot(poly_ids, kalshi_ids, wait_timeout=0.1))
+    except WebSocketDisconnect:
+        return
 
 
 @app.get("/api/balances")
