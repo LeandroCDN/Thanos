@@ -131,16 +131,84 @@ export function BotPanel() {
             </SettingsGroup>
 
             <SettingsGroup title="Exit">
-              <Toggle label="Close" checked={draft.close_enabled} onChange={(v) => update("close_enabled", v)} />
-              <Toggle label="Take profit" checked={draft.take_profit_enabled} onChange={(v) => update("take_profit_enabled", v)} />
-              <NumberField label="Take profit %" value={draft.take_profit_pct} step={0.1} onChange={(v) => update("take_profit_pct", v)} />
-              <Toggle label="Stop loss" checked={draft.stop_loss_enabled} onChange={(v) => update("stop_loss_enabled", v)} />
-              <NumberField label="Stop loss %" value={draft.stop_loss_pct} step={0.1} onChange={(v) => update("stop_loss_pct", v)} />
-              <Toggle label="Edge reversion" checked={draft.edge_reversion_enabled} onChange={(v) => update("edge_reversion_enabled", v)} />
-              <NumberField label="Close edge %" value={draft.close_edge_below_pct} step={0.1} onChange={(v) => update("close_edge_below_pct", v)} />
-              <NumberField label="Min close P&L %" value={draft.min_close_profit_pct} step={0.1} onChange={(v) => update("min_close_profit_pct", v)} />
-              <Toggle label="Before expiry" checked={draft.close_before_close_enabled} onChange={(v) => update("close_before_close_enabled", v)} />
-              <NumberField label="Expiry hours" value={draft.close_before_close_hours} step={1} onChange={(v) => update("close_before_close_hours", v)} />
+              <Toggle
+                label="Close"
+                checked={draft.close_enabled}
+                onChange={(v) => update("close_enabled", v)}
+                tooltip="Master switch for automated exits. When off, the bot will not close positions even if a close rule triggers."
+              />
+              <Toggle
+                label="Take profit"
+                checked={draft.take_profit_enabled}
+                onChange={(v) => update("take_profit_enabled", v)}
+                tooltip="Close when the close-now P&L percentage reaches the take-profit threshold."
+              />
+              <NumberField
+                label="Take profit %"
+                value={draft.take_profit_pct}
+                step={0.1}
+                onChange={(v) => update("take_profit_pct", v)}
+                tooltip="Close-now P&L percent required for the take-profit rule."
+              />
+              <Toggle
+                label="Stop loss"
+                checked={draft.stop_loss_enabled}
+                onChange={(v) => update("stop_loss_enabled", v)}
+                tooltip="Close when the close-now P&L percentage falls to or below the stop-loss threshold."
+              />
+              <NumberField
+                label="Stop loss %"
+                value={draft.stop_loss_pct}
+                step={0.1}
+                onChange={(v) => update("stop_loss_pct", v)}
+                tooltip="Negative P&L percent where the bot should cut the position."
+              />
+              <Toggle
+                label="Spread multiple"
+                checked={!!draft.spread_multiple_close_enabled}
+                onChange={(v) => update("spread_multiple_close_enabled", v)}
+                tooltip="Close when the close-now spread per contract is this many times the initial locked spread per contract."
+              />
+              <NumberField
+                label="Spread x"
+                value={draft.spread_multiple_close ?? 2}
+                step={0.1}
+                onChange={(v) => update("spread_multiple_close", Math.max(1, v))}
+                tooltip="Example: 2 closes when the realizable close-now spread is at least 2x the spread locked at entry."
+              />
+              <Toggle
+                label="Edge reversion"
+                checked={draft.edge_reversion_enabled}
+                onChange={(v) => update("edge_reversion_enabled", v)}
+                tooltip="Close profitable positions when the same-direction entry edge has faded below the configured edge threshold."
+              />
+              <NumberField
+                label="Close edge %"
+                value={draft.close_edge_below_pct}
+                step={0.1}
+                onChange={(v) => update("close_edge_below_pct", v)}
+                tooltip="For edge reversion: close once the current same-direction net edge is at or below this percent."
+              />
+              <NumberField
+                label="Min close P&L %"
+                value={draft.min_close_profit_pct}
+                step={0.1}
+                onChange={(v) => update("min_close_profit_pct", v)}
+                tooltip="Minimum close-now P&L required before edge reversion is allowed to close."
+              />
+              <Toggle
+                label="Before expiry"
+                checked={draft.close_before_close_enabled}
+                onChange={(v) => update("close_before_close_enabled", v)}
+                tooltip="Close positions as they approach the earliest venue close time."
+              />
+              <NumberField
+                label="Expiry hours"
+                value={draft.close_before_close_hours}
+                step={1}
+                onChange={(v) => update("close_before_close_hours", v)}
+                tooltip="How many hours before earliest close the expiry rule should trigger."
+              />
             </SettingsGroup>
 
             <SettingsGroup title="Risk">
@@ -158,7 +226,7 @@ export function BotPanel() {
               <NumberField label="Max positions" value={draft.max_open_positions} step={1} onChange={(v) => update("max_open_positions", Math.floor(v))} />
               <NumberField label="Daily loss $" value={draft.max_daily_loss} step={10} onChange={(v) => update("max_daily_loss", v)} />
               <NumberField label="Daily trades" value={draft.max_daily_trades} step={1} onChange={(v) => update("max_daily_trades", Math.floor(v))} />
-              <NumberField label="Max failures" value={draft.max_consecutive_failures} step={1} onChange={(v) => update("max_consecutive_failures", Math.floor(v))} />
+              <NumberField label="Max fatal failures" value={draft.max_consecutive_failures} step={1} onChange={(v) => update("max_consecutive_failures", Math.floor(v))} />
               <Toggle label="Stop on API error" checked={draft.stop_on_api_error} onChange={(v) => update("stop_on_api_error", v)} />
               <NumberField label="Poly fee %" value={draft.poly_fee * 100} step={0.1} onChange={(v) => update("poly_fee", v / 100)} />
               <NumberField label="Kalshi fee %" value={draft.kalshi_fee * 100} step={0.1} onChange={(v) => update("kalshi_fee", v / 100)} />
@@ -368,15 +436,17 @@ function NumberField({
   value,
   step,
   onChange,
+  tooltip,
 }: {
   label: string;
   value: number;
   step: number;
   onChange: (value: number) => void;
+  tooltip?: string;
 }) {
   return (
-    <label className="flex items-center justify-between gap-2 text-xs text-gray-400">
-      <span>{label}</span>
+    <label className="flex items-center justify-between gap-2 text-xs text-gray-400" title={tooltip}>
+      <span className={tooltip ? "cursor-help" : undefined}>{label}</span>
       <input
         type="number"
         value={Number.isFinite(value) ? value : 0}
@@ -413,10 +483,20 @@ function TextField({
   );
 }
 
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+function Toggle({
+  label,
+  checked,
+  onChange,
+  tooltip,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  tooltip?: string;
+}) {
   return (
-    <label className="flex items-center justify-between gap-2 text-xs text-gray-400">
-      <span>{label}</span>
+    <label className="flex items-center justify-between gap-2 text-xs text-gray-400" title={tooltip}>
+      <span className={tooltip ? "cursor-help" : undefined}>{label}</span>
       <input
         type="checkbox"
         checked={checked}

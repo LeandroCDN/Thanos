@@ -30,6 +30,8 @@ DEFAULT_BOT_SETTINGS: dict[str, Any] = {
     "take_profit_pct": 2.0,
     "stop_loss_enabled": False,
     "stop_loss_pct": -10.0,
+    "spread_multiple_close_enabled": False,
+    "spread_multiple_close": 2.0,
     "close_before_close_enabled": False,
     "close_before_close_hours": 6.0,
     "edge_reversion_enabled": True,
@@ -91,6 +93,12 @@ class Store:
                     added_at TEXT NOT NULL,
                     closed_at TEXT,
                     payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS live_pair_claims (
+                    pair_key TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS bot_logs (
@@ -258,6 +266,10 @@ class Store:
                 (pos["id"], status, pos["addedAt"], closed_at, json.dumps(pos)),
             )
             self._conn.commit()
+        if self._is_live_open_position(pos):
+            self._ensure_live_pair_claim(pos["polyId"], pos["kalshiId"], pos["id"])
+        elif pos.get("polyId") and pos.get("kalshiId"):
+            self._release_live_pair_if_unblocked(pos["polyId"], pos["kalshiId"])
         return pos
 
     def import_positions(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -268,8 +280,16 @@ class Store:
 
     def delete_position(self, position_id: str) -> None:
         with self._lock:
+            row = self._conn.execute("SELECT payload_json FROM positions WHERE id = ?", (position_id,)).fetchone()
             self._conn.execute("DELETE FROM positions WHERE id = ?", (position_id,))
             self._conn.commit()
+        if row:
+            try:
+                pos = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                pos = {}
+            if pos.get("polyId") and pos.get("kalshiId"):
+                self._release_live_pair_if_unblocked(pos["polyId"], pos["kalshiId"])
 
     def close_position(
         self,
@@ -290,6 +310,88 @@ class Store:
                 pos["closeReason"] = close_reason
             return self.upsert_position(pos)
         return None
+
+    def try_claim_live_pair(self, poly_id: str, kalshi_id: str, owner_id: str | None = None) -> tuple[bool, str, str]:
+        pair_key = self._live_pair_key(poly_id, kalshi_id)
+        owner_id = owner_id or os.urandom(16).hex()
+        now = utc_now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._open_live_pair_exists_unlocked(poly_id, kalshi_id):
+                    self._conn.rollback()
+                    return False, "already_open", owner_id
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO live_pair_claims (pair_key, owner_id, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(pair_key) DO NOTHING
+                    """,
+                    (pair_key, owner_id, now),
+                )
+                if cur.rowcount == 0:
+                    self._conn.rollback()
+                    return False, "claimed_by_another_process", owner_id
+                self._conn.commit()
+                return True, "claimed", owner_id
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def release_live_pair_claim(self, poly_id: str, kalshi_id: str, owner_id: str | None = None) -> None:
+        pair_key = self._live_pair_key(poly_id, kalshi_id)
+        with self._lock:
+            if owner_id:
+                self._conn.execute(
+                    "DELETE FROM live_pair_claims WHERE pair_key = ? AND owner_id = ?",
+                    (pair_key, owner_id),
+                )
+            else:
+                self._conn.execute("DELETE FROM live_pair_claims WHERE pair_key = ?", (pair_key,))
+            self._conn.commit()
+
+    def _ensure_live_pair_claim(self, poly_id: str, kalshi_id: str, owner_id: str) -> None:
+        pair_key = self._live_pair_key(poly_id, kalshi_id)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO live_pair_claims (pair_key, owner_id, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(pair_key) DO NOTHING
+                """,
+                (pair_key, owner_id, utc_now()),
+            )
+            self._conn.commit()
+
+    def _release_live_pair_if_unblocked(self, poly_id: str, kalshi_id: str) -> None:
+        with self._lock:
+            if self._open_live_pair_exists_unlocked(poly_id, kalshi_id):
+                return
+            self._conn.execute("DELETE FROM live_pair_claims WHERE pair_key = ?", (self._live_pair_key(poly_id, kalshi_id),))
+            self._conn.commit()
+
+    def _open_live_pair_exists_unlocked(self, poly_id: str, kalshi_id: str) -> bool:
+        rows = self._conn.execute("SELECT payload_json FROM positions WHERE status = 'open'").fetchall()
+        for row in rows:
+            try:
+                pos = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                continue
+            if self._is_live_open_position(pos) and self._position_matches_pair(pos, poly_id, kalshi_id):
+                return True
+        return False
+
+    @staticmethod
+    def _live_pair_key(poly_id: str, kalshi_id: str) -> str:
+        return f"{poly_id}::{kalshi_id}"
+
+    @staticmethod
+    def _is_live_open_position(position: dict[str, Any]) -> bool:
+        return position.get("status") == "open" and position.get("executionMode") != "paper"
+
+    @staticmethod
+    def _position_matches_pair(position: dict[str, Any], poly_id: str, kalshi_id: str) -> bool:
+        return str(position.get("polyId")) == str(poly_id) and str(position.get("kalshiId")) == str(kalshi_id)
 
     def log(self, level: str, event_type: str, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         created_at = utc_now()

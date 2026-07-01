@@ -301,9 +301,19 @@ async def open_trade(req: OpenTradeRequest):
     The execution layer re-fetches prices immediately before placing direct
     buy orders and aborts if either leg has moved beyond those limits.
     """
+    claimed, claim_reason, claim_owner = store.try_claim_live_pair(req.poly_id, req.kalshi_id)
+    if not claimed:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"Pair already has a live open position or in-flight open claim ({claim_reason})",
+                "execution_version": EXECUTION_VERSION,
+            },
+        )
     try:
         return await execute_open_trade(req)
     except Exception as exc:
+        store.release_live_pair_claim(req.poly_id, req.kalshi_id, claim_owner)
         raise HTTPException(
             status_code=400,
             detail={

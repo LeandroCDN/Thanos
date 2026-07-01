@@ -150,6 +150,8 @@ export interface BotSettings {
   take_profit_pct: number;
   stop_loss_enabled: boolean;
   stop_loss_pct: number;
+  spread_multiple_close_enabled: boolean;
+  spread_multiple_close: number;
   close_before_close_enabled: boolean;
   close_before_close_hours: number;
   edge_reversion_enabled: boolean;

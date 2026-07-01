@@ -44,7 +44,18 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
   const [balancesLoading, setBalancesLoading] = useState(false);
   const fees = loadFees();
 
-  const openPositions = useMemo(() => positions.filter((p) => p.status === "open"), [positions]);
+  const openPositions = useMemo(
+    () => positions.filter((p) => p.status === "open" && p.executionMode !== "paper"),
+    [positions],
+  );
+  const botHistory = useMemo(
+    () =>
+      positions
+        .filter((p) => p.source === "bot" && p.executionMode !== "paper")
+        .sort((a, b) => tradeTimestamp(b) - tradeTimestamp(a)),
+    [positions],
+  );
+  const botStats = useMemo(() => calcBotStats(botHistory), [botHistory]);
 
   const totals = useMemo(() => {
     const totalCapital = openPositions.reduce((s, p) => s + p.totalCapital, 0);
@@ -53,15 +64,13 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
     return { totalCapital, lockedProfit, lockedPct };
   }, [openPositions]);
   const liveVenueCapital = useMemo(() => {
-    return openPositions
-      .filter((p) => p.executionMode !== "paper")
-      .reduce(
-        (sum, pos) => ({
-          polymarket: sum.polymarket + (pos.polyCapital ?? 0),
-          kalshi: sum.kalshi + (pos.kalshiCapital ?? 0),
-        }),
-        { polymarket: 0, kalshi: 0 },
-      );
+    return openPositions.reduce(
+      (sum, pos) => ({
+        polymarket: sum.polymarket + (pos.polyCapital ?? 0),
+        kalshi: sum.kalshi + (pos.kalshiCapital ?? 0),
+      }),
+      { polymarket: 0, kalshi: 0 },
+    );
   }, [openPositions]);
 
   async function fetchBalances() {
@@ -123,7 +132,10 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
   }
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+    <div className="space-y-3">
+      <TradeHistoryPanel positions={botHistory} stats={botStats} />
+
+      <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
       {/* Header row 1: title + positions stats + refresh buttons */}
       <div className="px-4 py-3 border-b border-gray-800 bg-gray-900/50 flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-3 min-w-0 flex-wrap">
@@ -372,11 +384,198 @@ export function PositionsPanel({ positions, onRemove }: PositionsPanelProps) {
           </table>
         </div>
       )}
+      </div>
     </div>
   );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+interface BotStats {
+  openCount: number;
+  closedCount: number;
+  deployed: number;
+  lockedOpen: number;
+  realized: number;
+  totalPnl: number;
+  winRate: number | null;
+}
+
+function TradeHistoryPanel({
+  positions,
+  stats,
+}: {
+  positions: ArbitragePosition[];
+  stats: BotStats;
+}) {
+  const recent = positions.slice(0, 8);
+
+  return (
+    <section className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-800 bg-gray-900/50 flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3 min-w-0 flex-wrap">
+          <h2 className="font-semibold text-white shrink-0">Bot Trade History</h2>
+          <span className="text-xs text-gray-500 shrink-0">live bot only</span>
+        </div>
+        <div className="text-xs text-gray-500">
+          {stats.openCount} open / {stats.closedCount} closed
+        </div>
+      </div>
+
+      <div className="px-4 py-3 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-x-6 gap-y-3 border-b border-gray-800/60">
+        <HistoryMetric label="Trades" value={String(positions.length)} />
+        <HistoryMetric label="Deployed" value={formatMoney(stats.deployed)} />
+        <HistoryMetric label="Open Locked" value={formatSignedMoney(stats.lockedOpen)} tone={toneForNumber(stats.lockedOpen)} />
+        <HistoryMetric label="Realized" value={formatSignedMoney(stats.realized)} tone={toneForNumber(stats.realized)} />
+        <HistoryMetric label="Total P&L" value={formatSignedMoney(stats.totalPnl)} tone={toneForNumber(stats.totalPnl)} />
+        <HistoryMetric label="Win Rate" value={stats.winRate === null ? "-" : `${stats.winRate.toFixed(0)}%`} />
+      </div>
+
+      {recent.length === 0 ? (
+        <div className="px-4 py-5 text-sm text-gray-600">No live bot trades yet.</div>
+      ) : (
+        <div className="overflow-auto" style={{ maxHeight: "196px" }}>
+          <table className="w-full text-sm text-left">
+            <thead className="sticky top-0 bg-gray-900/95 backdrop-blur z-10">
+              <tr className="text-[11px] text-gray-500 uppercase tracking-wide border-b border-gray-800">
+                <th className="px-3 py-2 w-[12%]">Time</th>
+                <th className="px-3 py-2 w-[42%]">Pair</th>
+                <th className="px-3 py-2 w-[10%]">State</th>
+                <th className="px-3 py-2 w-[10%] text-right">Contracts</th>
+                <th className="px-3 py-2 w-[12%] text-right">Capital</th>
+                <th className="px-3 py-2 w-[14%] text-right">Result</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-800/50">
+              {recent.map((pos) => {
+                const isClosed = pos.status === "closed";
+                const pnl = isClosed ? Number(pos.realizedPnl ?? 0) : pos.lockedProfit;
+                const pct = pos.totalCapital > 0 ? (pnl / pos.totalCapital) * 100 : 0;
+
+                return (
+                  <tr key={pos.id} className="hover:bg-gray-800/30 transition-colors">
+                    <td className="px-3 py-2 text-xs text-gray-500 whitespace-nowrap">
+                      {formatCompactDate(pos.closedAt ?? pos.addedAt)}
+                    </td>
+                    <td className="px-3 py-2 min-w-[260px]">
+                      <div className="text-xs text-blue-300 truncate max-w-[460px]" title={pos.polyTitle}>
+                        {pos.polyTitle}
+                      </div>
+                      <div className="text-xs text-green-300 truncate max-w-[460px]" title={pos.kalshiTitle}>
+                        {pos.kalshiTitle}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <span
+                        className={`rounded border px-1.5 py-0.5 text-[10px] font-bold tracking-wide ${
+                          isClosed
+                            ? "border-gray-700 bg-gray-800/60 text-gray-300"
+                            : "border-blue-900 bg-blue-950/30 text-blue-200"
+                        }`}
+                      >
+                        {isClosed ? "CLOSED" : "OPEN"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-right font-mono text-xs text-gray-300">
+                      {pos.contracts.toFixed(1)}
+                    </td>
+                    <td className="px-3 py-2 text-right font-mono text-xs text-gray-300">
+                      {formatMoney(pos.totalCapital)}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <div className={`font-mono text-xs font-semibold ${toneForNumber(pnl)}`}>
+                        {formatSignedMoney(pnl)}
+                      </div>
+                      <div className="text-[10px] text-gray-600 font-mono">
+                        {isClosed ? "realized" : "locked"} {pct.toFixed(1)}%
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function HistoryMetric({
+  label,
+  value,
+  tone = "text-gray-200",
+}: {
+  label: string;
+  value: string;
+  tone?: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-gray-600">{label}</div>
+      <div className={`mt-0.5 font-mono text-sm font-semibold truncate ${tone}`}>{value}</div>
+    </div>
+  );
+}
+
+function calcBotStats(positions: ArbitragePosition[]): BotStats {
+  const open = positions.filter((p) => p.status === "open");
+  const closed = positions.filter((p) => p.status === "closed");
+  const deployed = open.reduce((sum, p) => sum + safeNumber(p.totalCapital), 0);
+  const lockedOpen = open.reduce((sum, p) => sum + safeNumber(p.lockedProfit), 0);
+  const realized = closed.reduce((sum, p) => sum + safeNumber(p.realizedPnl), 0);
+  const wins = closed.filter((p) => safeNumber(p.realizedPnl) > 0).length;
+
+  return {
+    openCount: open.length,
+    closedCount: closed.length,
+    deployed,
+    lockedOpen,
+    realized,
+    totalPnl: realized + lockedOpen,
+    winRate: closed.length > 0 ? (wins / closed.length) * 100 : null,
+  };
+}
+
+function tradeTimestamp(pos: ArbitragePosition) {
+  const ms = Date.parse(pos.closedAt ?? pos.addedAt);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function safeNumber(value: unknown) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatMoney(value: number) {
+  return `$${safeNumber(value).toFixed(2)}`;
+}
+
+function formatSignedMoney(value: number) {
+  const n = safeNumber(value);
+  const sign = n >= 0 ? "+" : "-";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+
+function toneForNumber(value: number) {
+  const n = safeNumber(value);
+  if (n > 0.004) return "text-green-400";
+  if (n < -0.004) return "text-red-400";
+  return "text-gray-300";
+}
+
+function formatCompactDate(d: string) {
+  try {
+    return new Date(d).toLocaleString("en-US", {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return d;
+  }
+}
 
 /**
  * What you'd net if you sold both legs right now at current bid prices.

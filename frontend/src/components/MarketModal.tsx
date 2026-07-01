@@ -201,7 +201,7 @@ export function MarketModal({
                 return (
                   <div
                     key={`${cp.source}:${cp.id}`}
-                    className={`flex items-start justify-between gap-3 rounded-lg border px-3 py-2 text-sm ${
+                    className={`rounded-lg border px-3 py-2 text-sm ${
                       whitelisted
                         ? "border-green-700 bg-green-950/20"
                         : preferred
@@ -209,9 +209,9 @@ export function MarketModal({
                           : "border-gray-800 bg-gray-800"
                     }`}
                   >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <div className="text-gray-200 truncate">{cp.title}</div>
+                    <div className="min-w-0">
+                      <div className="flex items-start gap-2">
+                        <div className="text-gray-200 leading-snug break-words">{cp.title}</div>
                         {(preferred || whitelisted) && (
                           <span
                             className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold text-white ${
@@ -225,50 +225,50 @@ export function MarketModal({
                       <div className={`mt-0.5 text-[11px] uppercase ${cp.source === "polymarket" ? "text-blue-400" : "text-green-400"}`}>
                         {cp.source} - {sourceDescriptor}
                       </div>
-                      {!whitelisted && candidate.reasons.length > 0 && (
-                        <div className="mt-0.5 text-[11px] text-gray-500">
-                          {candidate.reasons.join(" - ")}
-                        </div>
-                      )}
-                      {review && (
-                        <div className={`mt-1 text-[11px] ${reviewTone(review)}`} title={review.settlementAnalysis}>
-                          {reviewLabel(review)} {review.verdict.replace(/_/g, " ")} - {Math.round(review.confidence * 100)}% - {review.summary}
+                      {cp.source === "kalshi" && cp.rules && (
+                        <div className="mt-2 rounded border border-gray-800/80 bg-gray-950/40 px-2 py-1.5 text-[11px] leading-relaxed text-gray-400 whitespace-pre-wrap break-words max-h-28 overflow-y-auto">
+                          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-600">
+                            Resolution criteria
+                          </div>
+                          {cp.rules}
                         </div>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <div className="text-right">
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
                         <div className="text-green-400 text-xs">Y: ${cp.yes_bid?.toFixed(2) ?? "-"} / ${cp.yes_ask?.toFixed(2) ?? "-"}</div>
                         <div className="text-red-400 text-xs">N: ${cp.no_bid?.toFixed(2) ?? "-"} / ${cp.no_ask?.toFixed(2) ?? "-"}</div>
                       </div>
-                      {edge !== null && (
-                        <span
-                          className={`text-xs font-mono font-bold px-2 py-1 rounded ${
-                            edge > 0
-                              ? "bg-green-900/50 text-green-300"
-                              : edge < 0
-                                ? "bg-red-900/50 text-red-300"
-                                : "bg-gray-700 text-gray-400"
-                          }`}
-                        >
-                          {edge > 0 ? "+" : ""}
-                          {(edge * 100).toFixed(1)}%
-                        </span>
-                      )}
-                      {onWhitelistPair && (
-                        <button
-                          onClick={() => onWhitelistPair(poly, kalshi)}
-                          disabled={alreadyWhitelisted}
-                          className={`text-xs font-semibold px-2 py-1 rounded transition-colors ${
-                            alreadyWhitelisted
-                              ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-                              : "bg-blue-700 hover:bg-blue-600 text-white"
-                          }`}
-                          title={alreadyWhitelisted ? "Already whitelisted" : "Add to whitelist"}
-                        >
-                          {alreadyWhitelisted ? "SAVED" : "WHITELIST"}
-                        </button>
-                      )}
+                      <div className="flex items-center gap-2 shrink-0">
+                        {edge !== null && (
+                          <span
+                            className={`text-xs font-mono font-bold px-2 py-1 rounded ${
+                              edge > 0
+                                ? "bg-green-900/50 text-green-300"
+                                : edge < 0
+                                  ? "bg-red-900/50 text-red-300"
+                                  : "bg-gray-700 text-gray-400"
+                            }`}
+                          >
+                            {edge > 0 ? "+" : ""}
+                            {(edge * 100).toFixed(1)}%
+                          </span>
+                        )}
+                        {onWhitelistPair && (
+                          <button
+                            onClick={() => onWhitelistPair(poly, kalshi)}
+                            disabled={alreadyWhitelisted}
+                            className={`text-xs font-semibold px-2 py-1 rounded transition-colors ${
+                              alreadyWhitelisted
+                                ? "bg-gray-700 text-gray-500 cursor-not-allowed"
+                                : "bg-blue-700 hover:bg-blue-600 text-white"
+                            }`}
+                            title={alreadyWhitelisted ? "Already whitelisted" : "Add to whitelist"}
+                          >
+                            {alreadyWhitelisted ? "SAVED" : "WHITELIST"}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
@@ -411,21 +411,6 @@ function preferredBadgeLabel(review: AiPairReview | undefined): string {
   if (review?.status === "reviewed") return "Best reviewed";
   if (review?.status === "heuristic") return "Best rule";
   return "Top broad";
-}
-
-function reviewTone(review: AiPairReview): string {
-  if (review.status === "unconfigured" || review.status === "error") return "text-gray-500";
-  if (review.status === "heuristic" && (review.verdict === "analog" || review.verdict === "inverse")) return "text-cyan-300";
-  if (review.status === "heuristic") return "text-blue-300";
-  if (review.verdict === "analog" || review.verdict === "inverse") return "text-fuchsia-300";
-  if (review.verdict === "uncertain") return "text-yellow-300";
-  return "text-gray-500";
-}
-
-function reviewLabel(review: AiPairReview): string {
-  if (review.status === "reviewed") return "AI";
-  if (review.status === "heuristic") return "Rule";
-  return "Review";
 }
 
 function formatVolume(vol: number): string {

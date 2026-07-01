@@ -41,7 +41,7 @@ interface FeeConfig {
 const DEFAULT_FEES: FeeConfig = { polyFee: 0.02, kalshiFee: 0.07 };
 const FEE_STORAGE_KEY = "thanos:fees";
 const POLY_MIN_MARKET_BUY_DOLLARS = 1;
-const EXPECTED_EXECUTION_VERSION = "open-close-v7-depth-guard";
+const EXPECTED_EXECUTION_VERSION = "open-close-v10-live-pair-claim";
 
 function loadFees(): FeeConfig {
   try {

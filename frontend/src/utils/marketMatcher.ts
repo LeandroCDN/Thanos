@@ -3,11 +3,22 @@ import type { Market, MarketMatchMap, SuggestedCandidate, SuggestedMatch } from 
 const MIN_SCORE = 0.28;
 const MAX_CANDIDATES_PER_TOKEN = 400;
 const MAX_CANDIDATES_PER_MARKET = 12;
+const SEARCH_STRUCTURED_PREFIXES = [
+  "entity:",
+  "competition:",
+  "combo:",
+  "signature:",
+  "score:",
+  "score-signature:",
+  "score-winner:",
+  "tie:",
+];
 
 type MarketKind =
   | "exact_score"
   | "total"
   | "spread"
+  | "draw"
   | "winner"
   | "advance"
   | "elimination"
@@ -17,14 +28,31 @@ type MarketKind =
   | "tournament"
   | "generic";
 
+type MarketDomain =
+  | "sports_soccer"
+  | "sports_broadcast"
+  | "sports_stat"
+  | "politics_election"
+  | "entertainment_boxoffice"
+  | "entertainment_release"
+  | "economy_rates"
+  | "commodity_gas"
+  | "generic";
+
 const STOP_WORDS = new Set([
   "a",
   "an",
+  "after",
   "and",
   "are",
+  "before",
   "be",
   "by",
+  "criteria",
+  "data",
   "de",
+  "dec",
+  "december",
   "del",
   "el",
   "en",
@@ -32,24 +60,59 @@ const STOP_WORDS = new Set([
   "from",
   "get",
   "gets",
+  "if",
   "in",
   "into",
+  "made",
   "la",
   "las",
   "lo",
   "los",
   "market",
+  "note",
   "of",
+  "once",
   "on",
   "or",
   "para",
   "que",
   "quien",
+  "reported",
+  "resolve",
+  "resolved",
+  "resolves",
+  "resolution",
   "the",
   "this",
   "to",
+  "yes",
   "will",
   "with",
+]);
+
+const LOW_SIGNAL_TOKENS = new Set([
+  "ask",
+  "available",
+  "bid",
+  "calendar",
+  "close",
+  "column",
+  "contract",
+  "candidate",
+  "candidates",
+  "date",
+  "dates",
+  "election",
+  "elections",
+  "event",
+  "general",
+  "highest",
+  "made",
+  "president",
+  "presidential",
+  "public",
+  "source",
+  "target",
 ]);
 
 const KIND_WORDS = new Set([
@@ -99,6 +162,7 @@ const PHRASE_ALIASES: Array<[RegExp, string]> = [
   [/\bkorea south\b/g, "south korea"],
   [/\bkorea dpr\b/g, "north korea"],
   [/\bkorea north\b/g, "north korea"],
+  [/\bbox office\b/g, "boxoffice"],
 ];
 
 const COUNTRY_ALIASES: Array<[RegExp, string]> = [
@@ -154,18 +218,23 @@ const COUNTRY_ALIASES: Array<[RegExp, string]> = [
   [/\bqatar\b/g, "qatar"],
 ];
 
+const COUNTRY_TOKENS = new Set(COUNTRY_ALIASES.map(([, entity]) => entity));
+
 interface IndexedMarket {
   market: Market;
   key: string;
   tokens: Set<string>;
+  coreTokens: Set<string>;
   tokenList: string[];
   searchTokens: Set<string>;
+  domain: MarketDomain;
   kind: MarketKind;
   line: number | null;
   exactScore: ExactScore | null;
   tiePolicy: TiePolicy;
   matchup: [string, string] | null;
   subjects: Set<string>;
+  coreSubjects: Set<string>;
   structuredTokens: Set<string>;
   endTime: number | null;
 }
@@ -264,20 +333,24 @@ function indexMarket(market: Market): IndexedMarket {
       .join(" "),
   );
   const title = normalizeText(`${market.title} ${market.event_title ?? ""}`);
+  const coreText = normalizeText([market.title, market.event_title, market.category].filter(Boolean).join(" "));
+  const coreTokenList = tokenize(coreText);
+  const coreTokens = new Set(coreTokenList);
   const tokenList = tokenize(normalized);
   const tokens = new Set(tokenList);
   const matchup = extractMatchup(title) ?? extractMatchup(normalized);
+  const coreSubjects = extractSubjects(title, coreTokenList, matchup);
   const subjects = extractSubjects(title, tokenList, matchup);
+  const domain = classifyDomain(coreText, normalized);
   const kind = classifyKind(title, normalized);
   const line = extractLine(title) ?? extractLine(normalized);
   const exactScore = extractExactScore(title, normalized, matchup);
   const tiePolicy = extractTiePolicy(normalized);
   const structuredTokens = extractStructuredTokens(normalized, kind, exactScore, tiePolicy);
   const searchTokens = new Set<string>([
-    ...tokenList.filter((token) => !KIND_WORDS.has(token)),
-    ...subjects,
-    ...structuredTokens,
-    `kind:${kind}`,
+    ...coreTokenList.filter((token) => !KIND_WORDS.has(token)),
+    ...coreSubjects,
+    ...searchableStructuredTokens(structuredTokens),
   ]);
   if (line !== null) searchTokens.add(`line:${line}`);
   if (tiePolicy) searchTokens.add(`tie:${tiePolicy}`);
@@ -290,17 +363,26 @@ function indexMarket(market: Market): IndexedMarket {
     market,
     key: getMarketKey(market),
     tokens,
+    coreTokens,
     tokenList,
     searchTokens,
+    domain,
     kind,
     line,
     exactScore,
     tiePolicy,
     matchup,
     subjects,
+    coreSubjects,
     structuredTokens,
     endTime: parseEndTime(market.end_date),
   };
+}
+
+function searchableStructuredTokens(tokens: Set<string>): string[] {
+  return [...tokens].filter((token) =>
+    SEARCH_STRUCTURED_PREFIXES.some((prefix) => token.startsWith(prefix)),
+  );
 }
 
 function buildTokenIndex(markets: IndexedMarket[]): Map<string, IndexedMarket[]> {
@@ -318,13 +400,16 @@ function buildTokenIndex(markets: IndexedMarket[]): Map<string, IndexedMarket[]>
 }
 
 function scorePair(poly: IndexedMarket, kalshi: IndexedMarket) {
-  const sharedTerms = [...poly.tokens].filter((token) => kalshi.tokens.has(token));
-  const subjectScore = setSimilarity(poly.subjects, kalshi.subjects);
-  const tokenScore = setSimilarity(poly.tokens, kalshi.tokens);
-  const structuredScore = setSimilarity(poly.structuredTokens, kalshi.structuredTokens);
+  const sharedTerms = meaningfulSharedTerms(poly.coreTokens, kalshi.coreTokens);
+  const subjectScore = setSimilarity(poly.coreSubjects, kalshi.coreSubjects);
+  const tokenScore = setSimilarity(poly.coreTokens, kalshi.coreTokens);
+  const structuredScore = setSimilarity(
+    new Set(searchableStructuredTokens(poly.structuredTokens)),
+    new Set(searchableStructuredTokens(kalshi.structuredTokens)),
+  );
   const containmentScore =
-    Math.min(poly.tokens.size, kalshi.tokens.size) > 0
-      ? sharedTerms.length / Math.min(poly.tokens.size, kalshi.tokens.size)
+    Math.min(poly.coreTokens.size, kalshi.coreTokens.size) > 0
+      ? sharedTerms.length / Math.min(poly.coreTokens.size, kalshi.coreTokens.size)
       : 0;
   const dateScore = closeDateScore(poly.endTime, kalshi.endTime);
   const kindScore = kindCompatibility(poly.kind, kalshi.kind);
@@ -335,22 +420,34 @@ function scorePair(poly: IndexedMarket, kalshi: IndexedMarket) {
   const entityMatch = sharedPrefixed(poly.structuredTokens, kalshi.structuredTokens, "entity:").length > 0;
   const competitionMatch = sharedPrefixed(poly.structuredTokens, kalshi.structuredTokens, "competition:").length > 0;
   const signatureMatch = sharedPrefixed(poly.structuredTokens, kalshi.structuredTokens, "signature:").length > 0;
+  const hasMatchupAnchor = Boolean(poly.matchup && kalshi.matchup && matchupScore >= 0.75);
+  const hasStructuredAnchor = signatureMatch || exactScoreScore >= 0.95 || (entityMatch && competitionMatch) || hasMatchupAnchor;
+  const hasCoreAnchor = sharedTerms.length >= 2 || (sharedTerms.length >= 1 && subjectScore >= 0.18);
 
   const rawScore = clamp01(
-    structuredScore * 0.24
-    + subjectScore * 0.22
-    + tokenScore * 0.18
-    + containmentScore * 0.12
-    + dateScore * 0.08
-    + kindScore * 0.08
-    + lineScore * 0.04
-    + matchupScore * 0.04
+    structuredScore * 0.3
+    + subjectScore * 0.28
+    + tokenScore * 0.2
+    + containmentScore * 0.1
+    + dateScore * 0.03
+    + kindScore * 0.04
+    + lineScore * 0.03
+    + (hasMatchupAnchor ? matchupScore * 0.08 : 0)
     + exactScoreScore * 0.22
     + tiePolicyScore * 0.08
     + (signatureMatch ? 0.18 : 0)
     + (entityMatch && competitionMatch ? 0.1 : 0),
   );
-  const score = clampIncompatiblePairScore(poly, kalshi, rawScore, exactScoreScore, tiePolicyScore);
+  const anchoredScore = hasCoreAnchor || hasStructuredAnchor ? rawScore : Math.min(rawScore, 0.18);
+  const score = clampIncompatiblePairScore(
+    poly,
+    kalshi,
+    anchoredScore,
+    exactScoreScore,
+    tiePolicyScore,
+    entityMatch,
+    competitionMatch,
+  );
 
   const reasons = [
     exactScoreScore >= 0.95 ? "same exact scoreline" : "",
@@ -465,12 +562,42 @@ function classifyKind(title: string, fullText: string): MarketKind {
   return classifyKindFromText(`${title} ${fullText}`);
 }
 
+function classifyDomain(coreText: string, fullText: string): MarketDomain {
+  const text = `${coreText} ${fullText}`;
+  if (/\b(announcer|announcers|commentator|commentators|play by play|broadcast)\b/.test(text)) {
+    return "sports_broadcast";
+  }
+  if (/\b(corners?|corner kicks?|yellow cards?|red cards?|bookings?|shots on goal)\b/.test(text)) {
+    return "sports_stat";
+  }
+  if (/\b(fifa|world cup|soccer|football match|vs|versus)\b/.test(text)) {
+    return "sports_soccer";
+  }
+  if (/\b(presidential election|president|election|ballot|first round|runoff)\b/.test(text)) {
+    return "politics_election";
+  }
+  if (/\b(federal reserve|fed|interest rates?|rate cuts?|target federal funds)\b/.test(text)) {
+    return "economy_rates";
+  }
+  if (/\b(gas prices?|regular gas|gasoline)\b/.test(text)) {
+    return "commodity_gas";
+  }
+  if (/\b(boxoffice|gross|grosses|grossing|top movie|top gross|calendar gross)\b/.test(text)) {
+    return "entertainment_boxoffice";
+  }
+  if (/\b(movie|film|released|release|theatrical|streaming|dvd|blu-ray|media)\b/.test(text)) {
+    return "entertainment_release";
+  }
+  return "generic";
+}
+
 function classifyKindFromText(text: string): MarketKind {
   if (/\b(exact score|correct score|final score|score be)\b/.test(text) && /\b\d{1,2}\s*-\s*\d{1,2}\b/.test(text)) {
     return "exact_score";
   }
   if (/\b(o u|over under|total|totals|over|under)\b/.test(text)) return "total";
   if (/\b(spread|handicap|point spread|run line|puck line)\b/.test(text)) return "spread";
+  if (/\bdraw\b|\bend in a draw\b|\btie game\b/.test(text)) return "draw";
   if (/\b(best performing host|furthest advancing host|host nation)\b/.test(text)) return "best_host";
   if (/\bannounced as (?:a )?hosts?\b|\bwho will host\b|\bhost for the\b/.test(text)) return "host";
   if (/\bwinner of\b.*\bcome from\b|\bcome from\b.*\bwinner\b/.test(text)) return "regional_winner";
@@ -709,6 +836,7 @@ function kindCompatibility(a: MarketKind, b: MarketKind): number {
   if (a === b) return 1;
   if (a === "generic" || b === "generic") return 0.4;
   if (new Set([a, b]).has("advance") && new Set([a, b]).has("elimination")) return 0.55;
+  if (new Set([a, b]).has("draw")) return 0.05;
   if (new Set([a, b]).has("winner") && new Set([a, b]).has("best_host")) return 0.15;
   if (new Set([a, b]).has("winner") && new Set([a, b]).has("host")) return 0.05;
   if (new Set([a, b]).has("winner") && new Set([a, b]).has("regional_winner")) return 0.3;
@@ -746,8 +874,16 @@ function clampIncompatiblePairScore(
   rawScore: number,
   exactScoreScore: number,
   tiePolicyScore: number,
+  entityMatch: boolean,
+  competitionMatch: boolean,
 ): number {
   let score = rawScore;
+  if (!domainCompatible(poly.domain, kalshi.domain)) {
+    score = Math.min(score, 0.16);
+  }
+  if (!kindPairCanShareProposition(poly.kind, kalshi.kind, poly.domain, kalshi.domain, entityMatch, competitionMatch)) {
+    score = Math.min(score, 0.24);
+  }
   if (poly.exactScore && kalshi.exactScore && exactScoreScore < 0.9) {
     score = Math.min(score, 0.46);
   }
@@ -755,6 +891,36 @@ function clampIncompatiblePairScore(
     score = Math.min(score, 0.5);
   }
   return score;
+}
+
+function domainCompatible(a: MarketDomain, b: MarketDomain): boolean {
+  if (a === b) return true;
+  if (a === "generic" || b === "generic") return true;
+  return false;
+}
+
+function kindPairCanShareProposition(
+  a: MarketKind,
+  b: MarketKind,
+  aDomain: MarketDomain,
+  bDomain: MarketDomain,
+  entityMatch: boolean,
+  competitionMatch: boolean,
+): boolean {
+  if (a === b) return true;
+  if (a === "generic" || b === "generic") return true;
+  if (new Set([a, b]).has("advance") && new Set([a, b]).has("elimination")) return true;
+  if (
+    aDomain === "sports_soccer"
+    && bDomain === "sports_soccer"
+    && new Set([a, b]).has("tournament")
+    && new Set([a, b]).has("winner")
+    && entityMatch
+    && competitionMatch
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function closeDateScore(a: number | null, b: number | null): number {
@@ -782,6 +948,15 @@ function setSimilarity(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   const shared = [...a].filter((token) => b.has(token)).length;
   return (2 * shared) / (a.size + b.size);
+}
+
+function meaningfulSharedTerms(a: Set<string>, b: Set<string>): string[] {
+  return [...a].filter((token) =>
+    b.has(token)
+    && !LOW_SIGNAL_TOKENS.has(token)
+    && !COUNTRY_TOKENS.has(token)
+    && !/^\d{4}$/.test(token),
+  );
 }
 
 function sharedPrefixed(a: Set<string>, b: Set<string>, prefix: string): string[] {
@@ -825,10 +1000,17 @@ function normalizeSynonym(token: string): string {
   const synonyms: Record<string, string> = {
     america: "usa",
     americans: "usa",
+    film: "movie",
+    films: "movie",
     eeuu: "usa",
     ganara: "win",
     ganar: "win",
     gana: "win",
+    grossed: "gross",
+    grosses: "gross",
+    grossing: "gross",
+    highest: "top",
+    revenue: "gross",
     states: "usa",
     united: "usa",
     estadounidense: "usa",

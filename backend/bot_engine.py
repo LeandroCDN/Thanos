@@ -16,6 +16,7 @@ from arb_math import (
     compute_edges,
     hours_to_earliest_close,
     position_from_trade,
+    side_ask,
     side_bid,
 )
 from market_stream import market_stream
@@ -26,6 +27,8 @@ from trading import CloseTradeRequest, OpenTradeRequest, execute_close_trade, ex
 BotMode = Literal["off", "test", "on"]
 ExecutionStrategy = Literal["sequential", "concurrent_fok"]
 _UNSET = object()
+BOT_OPEN_LIQUIDITY_BUFFER = Decimal("0.75")
+BOT_OPEN_MAX_ATTEMPTS = 2
 
 
 class BotModeRequest(BaseModel):
@@ -51,6 +54,8 @@ class BotSettingsUpdate(BaseModel):
     take_profit_pct: float | None = None
     stop_loss_enabled: bool | None = None
     stop_loss_pct: float | None = None
+    spread_multiple_close_enabled: bool | None = None
+    spread_multiple_close: float | None = Field(default=None, ge=1)
     close_before_close_enabled: bool | None = None
     close_before_close_hours: float | None = Field(default=None, ge=0)
     edge_reversion_enabled: bool | None = None
@@ -344,8 +349,8 @@ class BotController:
                 self._reject(summary, pair_id, "size_below_one_contract", "Fixed trade size rounds below 1 contract")
                 continue
 
-            depth_ok = await self._depth_ok(settings, pair, trade, summary)
-            if not depth_ok:
+            depth_info = await self._depth_ok(settings, pair, trade, summary)
+            if not depth_info:
                 continue
 
             sized_trade = calc_trade_for_contracts(
@@ -387,7 +392,10 @@ class BotController:
                 "netEdgePct": sized_trade["netEdge"] * 100,
                 "grossEdgePct": sized_trade["grossEdge"] * 100,
                 "contracts": contracts,
+                "depthMode": depth_info["mode"],
             }
+            if depth_info["mode"] == "partial":
+                eligible["partialDepthContracts"] = depth_info["bufferedContracts"]
             summary["eligible"].append(eligible)
             summary["eligibleCount"] += 1
 
@@ -401,9 +409,21 @@ class BotController:
                 open_count += 1
                 current_capital += float(position.get("totalCapital") or 0)
                 summary["openedCount"] += 1
-                summary["executions"].append({"type": "open", "pairId": pair_id, "positionId": position["id"]})
+                summary["executions"].append(
+                    {
+                        "type": "open",
+                        "pairId": pair_id,
+                        "positionId": position["id"],
+                        "contracts": position.get("contracts"),
+                        "requestedContracts": position.get("requestedContracts", position.get("contracts")),
+                        "remainingContracts": position.get("remainingContracts", 0),
+                    }
+                )
                 store.set_state("bot_consecutive_failures", 0)
             except Exception as exc:
+                if self._is_recoverable_open_miss(exc):
+                    self._record_recoverable_open_miss(summary, pair_id, exc)
+                    continue
                 await self._record_error(settings, summary, "trade_open_failed", str(exc), {"pairId": pair_id})
 
     async def _evaluate_closes(
@@ -433,6 +453,7 @@ class BotController:
                     "positionId": position["id"],
                     "reason": close_eval["reason"],
                     "unrealizedPct": close_eval["unrealized"]["pct"],
+                    **({"spreadMultiple": close_eval["spreadMultiple"]} if "spreadMultiple" in close_eval else {}),
                 }
             )
             summary["eligibleCount"] += 1
@@ -466,32 +487,18 @@ class BotController:
         trade: dict[str, Any],
     ) -> dict[str, Any]:
         mode = settings["mode"]
+        open_meta: dict[str, Any] = {}
         if mode == "on":
-            result = await execute_open_trade(
-                OpenTradeRequest(
-                    poly_id=pair["polyId"],
-                    kalshi_id=pair["kalshiId"],
-                    poly_action=trade["polyAction"],
-                    kalshi_action=trade["kalshiAction"],
-                    contracts=Decimal(str(trade["contracts"])),
-                    max_poly_price=Decimal(str(trade["polyAsk"])),
-                    max_kalshi_price=Decimal(str(trade["kalshiAsk"])),
-                    max_total_cost=Decimal(str(trade["totalCost"])),
-                    first_venue="auto",
-                    market_data_max_age_ms=int(settings.get("market_data_max_age_ms") or 1000),
-                    execution_strategy=settings.get("execution_strategy", "sequential"),
-                )
-            )
-            contracts = float(result.get("contracts") or trade["contracts"])
-            live_trade = calc_trade_for_contracts(
-                trade["direction"],
-                float(result.get("poly", {}).get("price") or trade["polyAsk"]),
-                float(result.get("kalshi", {}).get("price") or trade["kalshiAsk"]),
-                contracts,
-                float(settings["poly_fee"]),
-                float(settings["kalshi_fee"]),
-            ) or trade
+            claimed, claim_reason, claim_owner = store.try_claim_live_pair(pair["polyId"], pair["kalshiId"])
+            if not claimed:
+                raise RuntimeError(f"Pair already has a live open position or in-flight open claim ({claim_reason})")
+            try:
+                live_trade, open_meta = await self._execute_live_open_with_follow_up(settings, pair, poly, kalshi, trade)
+            except Exception:
+                store.release_live_pair_claim(pair["polyId"], pair["kalshiId"], claim_owner)
+                raise
             position = position_from_trade(pair, poly, kalshi, live_trade, source="bot", execution_mode="live")
+            position.update(open_meta)
             position = store.upsert_position(position)
             log_type = "trade_opened"
         else:
@@ -499,6 +506,8 @@ class BotController:
             position = store.upsert_position(position)
             log_type = "paper_trade_opened"
 
+        net_edge_pct = float(open_meta.get("openNetEdgePct", trade["netEdge"] * 100))
+        gross_edge_pct = float(open_meta.get("openGrossEdgePct", trade["grossEdge"] * 100))
         store.log(
             "info",
             log_type,
@@ -506,9 +515,11 @@ class BotController:
             {
                 "positionId": position["id"],
                 "pairId": pair["id"],
-                "netEdgePct": trade["netEdge"] * 100,
-                "grossEdgePct": trade["grossEdge"] * 100,
-                "contracts": trade["contracts"],
+                "netEdgePct": net_edge_pct,
+                "grossEdgePct": gross_edge_pct,
+                "contracts": position["contracts"],
+                "requestedContracts": open_meta.get("requestedContracts", trade["contracts"]),
+                "remainingContracts": open_meta.get("remainingContracts", 0),
             },
         )
         await self._notify(
@@ -517,10 +528,235 @@ class BotController:
             (
                 f"Opened {mode.upper()} position\n"
                 f"{pair['polyTitle']} / {pair['kalshiTitle']}\n"
-                f"Net edge: {trade['netEdge'] * 100:.2f}% | Gross: {trade['grossEdge'] * 100:.2f}%"
+                f"Net edge: {net_edge_pct:.2f}% | Contracts: {position['contracts']:.0f}"
             ),
         )
         return position
+
+    async def _execute_live_open_with_follow_up(
+        self,
+        settings: dict[str, Any],
+        pair: dict[str, Any],
+        poly: dict[str, Any],
+        kalshi: dict[str, Any],
+        trade: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        requested_contracts = math.floor(float(trade["contracts"]))
+        if requested_contracts < 1:
+            raise RuntimeError("Live open size rounds below 1 contract")
+
+        remaining_contracts = requested_contracts
+        chunks: list[dict[str, Any]] = []
+        chunk_meta: list[dict[str, Any]] = []
+        follow_up_status = "not_needed"
+        current_poly = poly
+        current_kalshi = kalshi
+
+        for attempt in range(1, BOT_OPEN_MAX_ATTEMPTS + 1):
+            if remaining_contracts < 1:
+                follow_up_status = "completed" if len(chunks) > 1 else "not_needed"
+                break
+
+            if attempt > 1:
+                fresh_markets = await self._fresh_open_markets(pair)
+                if not fresh_markets:
+                    follow_up_status = "skipped: fresh_market_data_unavailable"
+                    break
+                current_poly, current_kalshi = fresh_markets
+                if self._too_close_to_expiry(settings, current_poly, current_kalshi):
+                    follow_up_status = "skipped: near_expiry"
+                    break
+
+            attempt_trade = calc_trade_for_contracts(
+                trade["direction"],
+                side_ask(current_poly, trade["polyAction"]),
+                side_ask(current_kalshi, trade["kalshiAction"]),
+                remaining_contracts,
+                float(settings["poly_fee"]),
+                float(settings["kalshi_fee"]),
+            )
+            if not attempt_trade:
+                follow_up_status = "skipped: missing_prices"
+                break
+            if float(attempt_trade["netEdge"]) < float(settings["min_net_edge"]):
+                follow_up_status = "skipped: edge_below_threshold"
+                break
+            min_contracts = math.ceil(1.0 / float(attempt_trade["polyAsk"]))
+            if remaining_contracts < min_contracts:
+                follow_up_status = "skipped: remaining_below_polymarket_minimum"
+                break
+            if attempt > 1:
+                balances_ok, balance_reason = await self._fresh_balances_cover_trade(attempt_trade)
+                if not balances_ok:
+                    follow_up_status = f"skipped: {balance_reason}"
+                    break
+
+            try:
+                result = await execute_open_trade(
+                    OpenTradeRequest(
+                        poly_id=pair["polyId"],
+                        kalshi_id=pair["kalshiId"],
+                        poly_action=trade["polyAction"],
+                        kalshi_action=trade["kalshiAction"],
+                        contracts=Decimal(str(remaining_contracts)),
+                        max_poly_price=Decimal(str(attempt_trade["polyAsk"])),
+                        max_kalshi_price=Decimal(str(attempt_trade["kalshiAsk"])),
+                        max_total_cost=Decimal(str(attempt_trade["totalCost"])),
+                        first_venue="auto",
+                        market_data_max_age_ms=int(settings.get("market_data_max_age_ms") or 1000),
+                        execution_strategy=settings.get("execution_strategy", "sequential"),
+                        max_leg_slippage=Decimal(str(settings.get("max_leg_slippage") or 0.01)),
+                        liquidity_buffer=BOT_OPEN_LIQUIDITY_BUFFER,
+                        allow_shrink=True,
+                    )
+                )
+            except Exception as exc:
+                if not chunks:
+                    raise
+                follow_up_status = f"failed: {exc}"
+                store.log(
+                    "warning",
+                    "trade_open_follow_up_failed",
+                    f"Follow-up open failed after partial fill: {exc}",
+                    {"pairId": pair["id"], "remainingContracts": remaining_contracts},
+                )
+                break
+
+            filled_contracts = math.floor(float(result.get("contracts") or 0))
+            if filled_contracts < 1:
+                if not chunks:
+                    raise RuntimeError("Live open returned zero filled contracts")
+                follow_up_status = "failed: zero_contract_fill"
+                break
+
+            filled_trade = calc_trade_for_contracts(
+                trade["direction"],
+                float(result.get("poly", {}).get("price") or attempt_trade["polyAsk"]),
+                float(result.get("kalshi", {}).get("price") or attempt_trade["kalshiAsk"]),
+                filled_contracts,
+                float(settings["poly_fee"]),
+                float(settings["kalshi_fee"]),
+            )
+            if not filled_trade:
+                if not chunks:
+                    raise RuntimeError("Live open fill could not be converted into a position")
+                follow_up_status = "failed: fill_accounting_failed"
+                break
+
+            remaining_contracts = max(0, remaining_contracts - filled_contracts)
+            chunks.append({"trade": filled_trade, "result": result, "attempt": attempt})
+            chunk_meta.append(
+                {
+                    "attempt": attempt,
+                    "requestedContracts": result.get("requested_contracts", str(filled_contracts + remaining_contracts)),
+                    "contracts": filled_contracts,
+                    "remainingContracts": remaining_contracts,
+                    "polyPrice": filled_trade["polyAsk"],
+                    "kalshiPrice": filled_trade["kalshiAsk"],
+                    "grossSpend": result.get("gross_spend"),
+                    "shrinkApplied": bool(result.get("shrink_applied")),
+                    "liquidityGuard": result.get("liquidity_guard", {}),
+                }
+            )
+            self._balance_cache = None
+
+            if remaining_contracts > 0 and attempt == 1:
+                follow_up_status = "pending"
+                store.log(
+                    "info",
+                    "trade_open_partial",
+                    (
+                        f"Opened {filled_contracts} of {requested_contracts} requested contracts; "
+                        f"trying follow-up for {remaining_contracts}."
+                    ),
+                    {
+                        "pairId": pair["id"],
+                        "filledContracts": filled_contracts,
+                        "requestedContracts": requested_contracts,
+                        "remainingContracts": remaining_contracts,
+                    },
+                )
+
+        if not chunks:
+            raise RuntimeError(f"Live open skipped before any fill ({follow_up_status})")
+
+        aggregate = self._aggregate_open_chunks(trade, chunks)
+        partial_open = int(round(float(aggregate["contracts"]))) < requested_contracts
+        if not partial_open and follow_up_status == "pending":
+            follow_up_status = "completed"
+        if partial_open and follow_up_status in {"not_needed", "pending"}:
+            follow_up_status = "partial_remaining"
+        return aggregate, {
+            "requestedContracts": requested_contracts,
+            "remainingContracts": max(0, requested_contracts - int(round(float(aggregate["contracts"])))),
+            "partialOpen": partial_open,
+            "followUpStatus": follow_up_status,
+            "openChunks": chunk_meta,
+            "openNetEdgePct": aggregate["netEdge"] * 100,
+            "openGrossEdgePct": aggregate["grossEdge"] * 100,
+        }
+
+    async def _fresh_open_markets(self, pair: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        poly_markets, kalshi_markets = await market_stream.get_pair_markets(
+            [pair["polyId"]],
+            [pair["kalshiId"]],
+            wait_timeout=0.2,
+        )
+        poly = next((market for market in poly_markets if market.get("id") == pair["polyId"]), None)
+        kalshi = next((market for market in kalshi_markets if market.get("id") == pair["kalshiId"]), None)
+        if not poly or not kalshi:
+            return None
+        return poly, kalshi
+
+    async def _fresh_balances_cover_trade(self, trade: dict[str, Any]) -> tuple[bool, str]:
+        try:
+            poly_balance, kalshi_balance = await asyncio.gather(poly_data.fetch_balance(), kalshi_data.fetch_balance())
+        except Exception as exc:
+            return False, f"balance_check_failed ({exc})"
+        balances = {"polymarket": poly_balance, "kalshi": kalshi_balance}
+        if poly_balance.get("error") or kalshi_balance.get("error"):
+            return False, "balance_check_failed"
+        if not self._balances_cover(balances, trade):
+            return False, "insufficient_balance"
+        return True, "ok"
+
+    @staticmethod
+    def _aggregate_open_chunks(base_trade: dict[str, Any], chunks: list[dict[str, Any]]) -> dict[str, Any]:
+        trades = [chunk["trade"] for chunk in chunks]
+        contracts = sum(float(trade["contracts"]) for trade in trades)
+        if contracts <= 0:
+            return base_trade
+
+        poly_ask = sum(float(trade["polyAsk"]) * float(trade["contracts"]) for trade in trades) / contracts
+        kalshi_ask = sum(float(trade["kalshiAsk"]) * float(trade["contracts"]) for trade in trades) / contracts
+        poly_spend = sum(float(trade["polySpend"]) for trade in trades)
+        kalshi_spend = sum(float(trade["kalshiSpend"]) for trade in trades)
+        total_cost = sum(float(trade["totalCost"]) for trade in trades)
+        poly_fees_paid = sum(float(trade["polyFeesPaid"]) for trade in trades)
+        kalshi_fees_paid = sum(float(trade["kalshiFeesPaid"]) for trade in trades)
+        total_fees = poly_fees_paid + kalshi_fees_paid
+        gross_profit = sum(float(trade["grossProfit"]) for trade in trades)
+        net_profit = sum(float(trade["netProfit"]) for trade in trades)
+        return {
+            "direction": base_trade["direction"],
+            "polyAction": base_trade["polyAction"],
+            "kalshiAction": base_trade["kalshiAction"],
+            "polyAsk": poly_ask,
+            "kalshiAsk": kalshi_ask,
+            "grossEdge": gross_profit / contracts,
+            "netEdge": net_profit / contracts,
+            "contracts": contracts,
+            "polySpend": poly_spend,
+            "kalshiSpend": kalshi_spend,
+            "totalCost": total_cost,
+            "polyFeesPaid": poly_fees_paid,
+            "kalshiFeesPaid": kalshi_fees_paid,
+            "totalFees": total_fees,
+            "grossProfit": gross_profit,
+            "grossProfitPct": (gross_profit / total_cost) * 100 if total_cost > 0 else 0,
+            "netProfit": net_profit,
+            "netProfitPct": (net_profit / total_cost) * 100 if total_cost > 0 else 0,
+        }
 
     async def _close_position(
         self,
@@ -599,6 +835,17 @@ class BotController:
             return {"reason": "take_profit", "unrealized": unrealized}
         if settings.get("stop_loss_enabled") and pct <= float(settings["stop_loss_pct"]):
             return {"reason": "stop_loss", "unrealized": unrealized}
+        spread_multiple = self._close_spread_multiple(position, unrealized)
+        if (
+            settings.get("spread_multiple_close_enabled")
+            and spread_multiple is not None
+            and spread_multiple >= float(settings["spread_multiple_close"])
+        ):
+            return {
+                "reason": "spread_multiple",
+                "unrealized": unrealized,
+                "spreadMultiple": spread_multiple,
+            }
         hours = hours_to_earliest_close(poly, kalshi)
         if (
             settings.get("close_before_close_enabled")
@@ -613,13 +860,24 @@ class BotController:
                 return {"reason": "edge_reversion", "unrealized": unrealized}
         return None
 
+    @staticmethod
+    def _close_spread_multiple(position: dict[str, Any], unrealized: dict[str, float]) -> float | None:
+        contracts = float(position.get("contracts") or 0)
+        if contracts <= 0:
+            return None
+        initial_spread = float(position.get("lockedProfit") or 0) / contracts
+        if initial_spread <= 0:
+            return None
+        current_close_spread = float(unrealized.get("pnl") or 0) / contracts
+        return current_close_spread / initial_spread
+
     async def _depth_ok(
         self,
         settings: dict[str, Any],
         pair: dict[str, Any],
         trade: dict[str, Any],
         summary: dict[str, Any],
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         try:
             depth = await market_stream.analyse_depth(
                 pair["polyId"],
@@ -630,19 +888,43 @@ class BotController:
             )
         except Exception as exc:
             self._reject(summary, pair["id"], "depth_failed", f"Depth scan failed: {exc}")
-            return False
+            return None
 
         direction_depth = depth.get(trade["direction"]) or {}
-        if float(direction_depth.get("ideal_bet") or 0) < float(settings["fixed_trade_dollars"]):
-            self._reject(
-                summary,
-                pair["id"],
-                "insufficient_depth",
-                "Order-book depth is below the fixed trade size at configured slippage",
-                {"depth": depth},
+        ideal_bet = float(direction_depth.get("ideal_bet") or 0)
+        max_shares = float(direction_depth.get("max_shares") or 0)
+        buffered_contracts = math.floor(max_shares * float(BOT_OPEN_LIQUIDITY_BUFFER))
+        min_contracts = math.ceil(1.0 / float(trade["polyAsk"])) if float(trade["polyAsk"]) > 0 else math.inf
+        if ideal_bet >= float(settings["fixed_trade_dollars"]):
+            return {
+                "mode": "full",
+                "idealBet": ideal_bet,
+                "bufferedContracts": buffered_contracts,
+                "minContracts": min_contracts,
+            }
+        if buffered_contracts >= min_contracts:
+            return {
+                "mode": "partial",
+                "idealBet": ideal_bet,
+                "bufferedContracts": buffered_contracts,
+                "minContracts": min_contracts,
+            }
+
+        if max_shares > 0:
+            message = (
+                "Order-book depth can only support a partial size below the Polymarket minimum "
+                f"({buffered_contracts} buffered contracts, needs {min_contracts})"
             )
-            return False
-        return True
+        else:
+            message = "Order-book depth is below the fixed trade size at configured slippage"
+        self._reject(
+            summary,
+            pair["id"],
+            "insufficient_depth",
+            message,
+            {"depth": depth, "bufferedContracts": buffered_contracts, "minContracts": min_contracts},
+        )
+        return None
 
     async def _fetch_balances(self, settings: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any] | None:
         ttl = float(settings.get("balance_cache_seconds") or 0)
@@ -670,8 +952,11 @@ class BotController:
         return poly_available >= float(trade["polySpend"]) and kalshi_available >= float(trade["kalshiSpend"])
 
     def _too_close_to_expiry(self, settings: dict[str, Any], poly: dict[str, Any], kalshi: dict[str, Any]) -> bool:
+        min_hours = float(settings["min_hours_to_close"])
+        if min_hours <= 0:
+            return False
         hours = hours_to_earliest_close(poly, kalshi)
-        return hours is not None and hours < float(settings["min_hours_to_close"])
+        return hours is not None and hours < min_hours
 
     async def _circuit_breaker_hit(self, settings: dict[str, Any], summary: dict[str, Any]) -> bool:
         max_daily_trades = int(settings.get("max_daily_trades") or 0)
@@ -708,6 +993,43 @@ class BotController:
             await self._trip(settings, summary, "max_consecutive_failures", "Consecutive failure limit reached")
         elif settings.get("stop_on_api_error") and event_type in {"market_fetch_failed", "balance_check_failed"}:
             await self._trip(settings, summary, event_type, message)
+
+    def _record_recoverable_open_miss(self, summary: dict[str, Any], pair_id: str, exc: Exception) -> None:
+        message = str(exc)
+        self._reject(
+            summary,
+            pair_id,
+            "execution_liquidity_miss",
+            "Live entry was skipped because the order book moved or thinned before execution",
+            {"error": message},
+        )
+        store.log(
+            "warning",
+            "trade_open_liquidity_miss",
+            "Live entry skipped; pair remains eligible for future scans if conditions return",
+            {"pairId": pair_id, "error": message},
+        )
+
+    @staticmethod
+    def _is_recoverable_open_miss(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if any(marker in message for marker in ("after polymarket fill", "after kalshi fill", "unwind", "concurrent open failed")):
+            return False
+        return any(
+            marker in message
+            for marker in (
+                "fresh order-book depth is too thin",
+                "buffered executable size",
+                "insufficient liquidity",
+                "insufficient depth",
+                "resting volume",
+                "fill_or_kill",
+                "fok",
+                "minimum market-order spend",
+                "liquidity vanished",
+                "below the polymarket minimum",
+            )
+        )
 
     async def _trip(self, settings: dict[str, Any], summary: dict[str, Any], reason: str, message: str) -> None:
         if settings.get("mode") != "off":

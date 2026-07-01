@@ -18,7 +18,7 @@ import kalshi as kalshi_data
 import polymarket as poly_data
 from market_stream import market_stream
 
-EXECUTION_VERSION = "open-close-v7-depth-guard"
+EXECUTION_VERSION = "open-close-v10-live-pair-claim"
 ExecutionStrategy = Literal["sequential", "concurrent_fok"]
 _POLY_TOKEN_CACHE: dict[tuple[str, str], str] = {}
 DEFAULT_OPEN_MAX_LEG_SLIPPAGE = Decimal("0.01")
@@ -69,6 +69,7 @@ def _price(value: Decimal) -> Decimal:
 
 
 async def execute_open_trade(req: OpenTradeRequest) -> dict:
+    requested_contracts = _count(req.contracts)
     poly_markets, kalshi_markets = await _fresh_pair_markets(
         req.poly_id,
         req.kalshi_id,
@@ -93,6 +94,11 @@ async def execute_open_trade(req: OpenTradeRequest) -> dict:
             **(liquidity_guard or {}),
             "retry": retry_guard,
         }
+    filled_contracts = _count(Decimal(str(result.get("contracts") or "0")))
+    remaining_contracts = max(Decimal("0"), requested_contracts - filled_contracts)
+    result["requested_contracts"] = str(requested_contracts)
+    result["remaining_contracts"] = str(remaining_contracts)
+    result["shrink_applied"] = remaining_contracts > 0
     if liquidity_guard:
         result["liquidity_guard"] = liquidity_guard
     return result
@@ -329,7 +335,7 @@ async def _guard_open_trade_liquidity(
         req.kalshi_id,
         edge_threshold=0,
         max_leg_slippage=float(req.max_leg_slippage),
-        max_bet_dollars=float(req.max_total_cost),
+        max_bet_dollars=float(req.max_total_cost / req.liquidity_buffer),
     )
     direction_depth = depth.get(direction) or {}
     max_shares = Decimal(str(direction_depth.get("max_shares") or "0"))

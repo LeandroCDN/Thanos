@@ -102,7 +102,7 @@ export function MarketTable({
 
   useEffect(() => {
     setVisibleRowsCount(INITIAL_VISIBLE_ROWS);
-  }, [searchQuery, localSearch, sortField, sortDir, markets.length]);
+  }, [searchQuery, localSearch, sortField, sortDir]);
 
   const indexedRows = useMemo<IndexedRow[]>(
     () =>
